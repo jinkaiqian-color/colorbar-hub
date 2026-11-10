@@ -51,6 +51,9 @@ main{padding:16px clamp(16px,4vw,48px) 64px}
 .size{font-size:26px;overflow-wrap:anywhere;line-height:1.1;font-weight:700;letter-spacing:-.02em;margin:0}
 .size small{font-size:15px;font-weight:600;color:var(--muted);letter-spacing:0}
 .sizeNote{margin:6px 0 0;color:var(--muted);font-size:13px}
+.opt{display:flex;gap:8px;align-items:flex-start;margin-top:14px;font-size:14px;cursor:pointer}
+.opt input{margin-top:4px}
+.repeatNote{margin:10px 0 0;padding:8px 10px;background:#e8f3ec;border-left:4px solid #2c8a52;font-size:13px;border-radius:0 4px 4px 0}
 .markNote{margin:10px 0 0;padding:8px 10px;background:var(--panel-2);border-left:4px solid var(--accent);font-size:13px;border-radius:0 4px 4px 0}
 dl{margin:16px 0 0;display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 14px}
 dt{color:var(--muted)}

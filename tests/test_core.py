@@ -401,3 +401,181 @@ def test_mark_detector_needs_the_7_5_3_proportions():
     marks = core.find_corner_marks([sq(50, 50, 10), sq(53, 50, 7.1), sq(50, 50, 4.3)])
     assert len(marks) == 1 and marks[0]["kind"] == "partial"
     assert core.find_corner_marks([sq(50, 50, 10), sq(53, 50, 7.1), sq(53, 50, 4.3)]) == []
+
+
+# ---- step and repeat ------------------------------------------------------------------------------
+
+def one(**kw):
+    return core.analyze_for_web(build_pdf(**kw), name="sheet.pdf")["candidates"][0]
+
+
+def test_find_period_on_plain_sequences():
+    core_ = list("ABCDEFGH")
+    assert core.find_period(core_ * 3) == 8
+    assert core.find_period(core_ * 2) == 8
+    assert core.find_period(core_) is None                     # one copy is not a repeat
+    assert core.find_period(core_ * 2 + list("ABC")) == 8      # the last copy may be cut short
+    assert core.find_period(list("ABCDEFGHABCDEFGX")) is None  # one slot differs
+    assert core.find_period(list("AB") * 6) == 4               # a core has at least 4 slots, so "ABAB" is the core here
+    assert core.find_period(list("ABCD") * 3) == 4
+    assert core.find_period(list("ABCDXXABCDXXABCD")) == 6     # a gap between the copies is part of the period
+    assert core.find_period([]) is None
+
+
+def test_a_bar_that_does_not_repeat_is_not_flagged():
+    c = one(orientation="horizontal")
+    assert c["repeat"] is None
+    assert core.analyze(build_pdf("horizontal", corner_mark="end", markers=("circle_gap",)))["ignored"]["repeated_copies"] == 0
+
+
+def test_copies_end_to_end_on_one_grid_fold_into_one_core():
+    single = one(orientation="horizontal")
+    c = one(orientation="horizontal", repeat=(3, 72.0))
+    assert c["slot_count"] == single["slot_count"] == 18
+    assert labels(c) == labels(single)
+    r = c["repeat"]
+    assert r["found"] and r["copies_along"] == 3 and r["copies_across"] == 1 and r["on_grid"] is True
+    assert r["period_slots"] == 18 and approx(r["step_mm"], 72.0, 0.05) and approx(r["full_length_mm"], 216.0, 0.05)
+    assert approx(r["core_length_mm"], 72.0, 0.05) and r["partial_last"] is False
+    assert c["warnings"] == []
+
+
+def test_copies_with_empty_slots_between_them_fold_and_the_gap_is_not_part_of_the_core():
+    c = one(orientation="horizontal", repeat=(3, 80.0))        # two empty slots between the copies
+    assert c["slot_count"] == 18 and c["repeat"]["copies_along"] == 3 and c["repeat"]["on_grid"] is True
+    assert approx(c["repeat"]["step_mm"], 80.0, 0.05)
+    assert c["patches"][-1]["empty"] is False                  # the core ends at its last patch
+
+
+def test_copies_stepped_off_the_grid_each_get_their_own_grid_and_fold():
+    c = one(orientation="horizontal", repeat=(3, 75.5))        # 3.5 mm between the copies: not a whole slot
+    assert c["slot_count"] == 18 and c["repeat"]["copies_along"] == 3 and c["repeat"]["on_grid"] is False
+    assert approx(c["repeat"]["step_mm"], 75.5, 0.05) and approx(c["repeat"]["full_length_mm"], 223.0, 0.05)
+    assert c["warnings"] == []                                 # no "off the grid" or "irregular spacing" warnings
+    assert labels(c) == labels(one(orientation="horizontal"))
+
+
+def test_copies_placed_as_a_form_xobject_are_found_too():
+    for step in (72.0, 75.5):
+        c = one(orientation="horizontal", repeat=(3, step), as_form=True)
+        assert c["slot_count"] == 18 and c["repeat"]["copies_along"] == 3
+
+
+def test_the_xml_of_a_repeated_bar_is_the_xml_of_its_core():
+    single = core.analyze_for_web(build_pdf("horizontal"), name="sheet.pdf")["candidates"][0]["xml"]
+    for kw in ({"repeat": (3, 72.0)}, {"repeat": (3, 80.0)}, {"repeat": (4, 75.5)}, {"repeat": (3, 75.5), "as_form": True},
+               {"rows": (2, 9.0)}, {"repeat": (3, 75.5), "rows": (2, 9.0)}):
+        assert one(orientation="horizontal", **kw)["xml"] == single, kw
+
+
+def test_identical_bars_on_separate_lines_are_one_design_repeated_across_the_sheet():
+    res = core.analyze(build_pdf("horizontal", rows=(2, 9.0)))
+    assert len(res["candidates"]) == 1
+    r = res["candidates"][0]["repeat"]
+    assert r["copies_across"] == 2 and r["copies_along"] == 1 and r["step_mm"] is None
+    assert res["ignored"]["repeated_copies"] == 1
+
+
+def test_repeats_along_and_across_together():
+    r = one(orientation="horizontal", repeat=(3, 75.5), rows=(2, 9.0))["repeat"]
+    assert r["copies_along"] == 3 and r["copies_across"] == 2
+
+
+def test_vertical_bars_repeat_too():
+    for step, on_grid in ((72.0, True), (75.5, False)):
+        c = one(orientation="vertical", repeat=(3, step))
+        assert c["orientation"] == "vertical" and c["slot_count"] == 18
+        assert c["repeat"]["copies_along"] == 3 and c["repeat"]["on_grid"] is on_grid
+
+
+def test_the_reported_position_and_crop_cover_the_core_only():
+    c = one(orientation="horizontal", repeat=(3, 75.5))
+    assert approx(c["origin_mm"]["x"], 14.0, 0.05)             # the first copy
+    assert approx(c["bbox_mm"]["w"], 72.0, 0.05)               # one core wide, not the whole run
+    b = c["bbox_pt"]
+    assert approx((b["x1"] - b["x0"]) * 25.4 / 72, 72.0, 0.05)
+
+
+def test_corner_marks_still_set_the_reading_order_of_a_repeated_bar():
+    single = one(orientation="horizontal", corner_mark="end")
+    c = one(orientation="horizontal", corner_mark="end", repeat=(3, 90.0))
+    assert c["direction"] == single["direction"] == "right to left"
+    assert labels(c) == labels(single) and c["repeat"]["copies_along"] == 3
+
+
+def test_ignored_counts_report_the_extra_copies():
+    res = core.analyze(build_pdf("horizontal", repeat=(4, 75.5)))
+    assert res["ignored"]["repeated_copies"] == 3
+    assert res["ignored"]["other_rectangles"] < 30             # the copies are not counted as stray rectangles
+
+
+def test_a_tint_ladder_stacked_in_a_cell_is_part_of_the_bar_not_a_bar_of_its_own():
+    res = core.analyze(build_pdf("horizontal", markers=("ladder",)))
+    assert len(res["candidates"]) == 1
+    last = res["candidates"][0]["patches"][-1]
+    assert last["kind"] == "split" and last["label"] == "K2 / K3 / K4 / K5"
+    res = core.analyze(build_pdf("horizontal", markers=("ladder",), repeat=(3, 75.5)))
+    assert len(res["candidates"]) == 1 and res["candidates"][0]["repeat"]["copies_along"] == 3
+
+
+def test_different_designs_on_one_line_are_not_folded():
+    # two grids on one line with different content: the second copy has its S1 tints changed
+    toks_a, toks_b = list("ABCDEFGH"), list("ABCDEFGX")
+    assert core.find_period(toks_a + toks_b) is None
+
+
+# ---- printed percentage labels against the patches ---------------------------------------------------
+
+def test_correct_percentage_labels_raise_nothing():
+    c = one(orientation="horizontal", markers=("labels",))
+    assert c["label_mismatches"] == [] and c["warnings"] == []
+    assert "xml_as_drawn" not in c
+
+
+def test_a_label_that_contradicts_its_patch_is_flagged():
+    c = one(orientation="horizontal", markers=("label_wrong",))
+    assert c["label_mismatches"] == [{"slot": 2, "label_pct": 75, "ink": "C", "patch_pct": 100}]
+    assert c["warnings"] == ["The printed label says 75% but the patch is C 100% at slot 2."]
+    rec = c["patches"][1]
+    assert rec["label"] == "C100" and rec["label_pct"] == 75 and rec["detail"] == "label says 75%"
+    assert c["patches"][0].get("label_pct") is None
+
+
+def test_the_xml_follows_the_label_by_default_and_can_keep_the_patch_as_drawn():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal", markers=("label_wrong",))
+    seq = lambda x: [t.get("rRef") for t in ET.fromstring(x).find("TemplatePatches")]
+    assert seq(c["xml"])[1] == "P_TC" and seq(c["xml_as_drawn"])[1] == "P_C"
+    assert [i for i, (a, b) in enumerate(zip(seq(c["xml"]), seq(c["xml_as_drawn"]))) if a != b] == [1]
+    assert any("label says 75% but the patch is C 100%" in n and "(P_TC)" in n for n in c["xml_notes"])
+    assert c["xml_as_drawn_notes"] == []
+    root = ET.fromstring(c["xml"])
+    d = {t.get("ID"): t.find("PatchTypeData").attrib for t in root.find("ReferencePatches")}
+    assert d["P_TC"] == {"Slot": "2", "Raster": "0.75", "RasterClass": "3"}
+    assert core.build_xml({"file": "sheet.pdf"}, c, use_labels=False)[0] == c["xml_as_drawn"]
+
+
+def test_labels_are_matched_to_the_right_slot_when_the_bar_is_read_from_the_other_end():
+    c = one(orientation="horizontal", corner_mark="end", markers=("label_wrong",))
+    assert c["direction"] == "right to left"
+    assert c["label_mismatches"][0]["slot"] == 17                        # slot 2 from the left is slot 17 from the right
+    assert c["patches"][16]["label_pct"] == 75
+
+
+def test_a_repeated_bar_reports_a_wrong_label_once_for_the_core():
+    for kw in ({"repeat": (3, 72.0)}, {"repeat": (3, 75.5)}, {"repeat": (3, 75.5), "as_form": True}):
+        c = one(orientation="horizontal", markers=("label_wrong",), **kw)
+        assert [d["slot"] for d in c["label_mismatches"]] == [2], kw
+
+
+def test_text_that_is_not_a_percentage_or_not_next_to_the_bar_is_ignored():
+    # the decoy artwork carries "SAMPLE SHEET - DECOY ARTWORK" far from the bar
+    c = one(orientation="horizontal")
+    assert c["label_mismatches"] == []
+
+
+def test_a_label_over_a_patch_with_several_inks_is_not_compared():
+    # the gray-balance patch in slot 6 carries three inks; a percentage label there cannot be checked against one tint
+    c = one(orientation="horizontal", markers=("labels",))
+    assert c["patches"][5]["kind"] == "ink" and len(c["patches"][5]["inks"]) == 3
+    assert c["patches"][5].get("label_pct") is None

@@ -55,3 +55,47 @@ def test_sample_sheet_is_analyzed_in_the_browser(base_url):
         assert download.value.suggested_filename == "colorbar_sample_bar.xml"
         assert errors == []
         browser.close()
+
+
+def test_a_step_and_repeat_sheet_shows_only_the_core(base_url, tmp_path):
+    import sys
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from make_sample import build_pdf
+    pdf = tmp_path / "repeated.pdf"
+    pdf.write_bytes(build_pdf("horizontal", repeat=(3, 75.5)))
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(base_url)
+        page.wait_for_selector("#engine.ready", timeout=240_000)
+        page.set_input_files("#file", str(pdf))
+        page.wait_for_selector("#out.on", timeout=120_000)
+        assert "Step and repeat found" in page.inner_text("#summary")
+        assert "3 times along the bar" in page.inner_text("#summary")
+        assert page.locator("#tbl tbody tr").count() == 18         # one core, not three
+        browser.close()
+
+
+def test_a_label_that_contradicts_its_patch_can_be_followed_or_not(base_url, tmp_path):
+    import sys
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from make_sample import build_pdf
+    pdf = tmp_path / "labelled.pdf"
+    pdf.write_bytes(build_pdf("horizontal", markers=("label_wrong",)))
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(base_url)
+        page.wait_for_selector("#engine.ready", timeout=240_000)
+        page.set_input_files("#file", str(pdf))
+        page.wait_for_selector("#out.on", timeout=120_000)
+        assert "The printed label says 75% but the patch is C 100% at slot 2." in page.inner_text("#summary")
+        assert page.is_checked("#useLabels")
+        with page.expect_download() as d1:
+            page.click("#dlXml")
+        assert 'rRef="P_TC"' in open(d1.value.path(), encoding="utf-8").read()
+        page.uncheck("#useLabels")
+        with page.expect_download() as d2:
+            page.click("#dlXml")
+        assert 'rRef="P_TC"' not in open(d2.value.path(), encoding="utf-8").read()
+        browser.close()

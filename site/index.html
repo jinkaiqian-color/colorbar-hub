@@ -64,6 +64,7 @@
       <li>Every filled rectangle is collected with its size, position and ink. Images, text, curved shapes and shapes in production inks (dieline, registration, cut) are set aside.</li>
       <li>Rectangles of the same size are grouped. A color bar is a group on one straight line, advancing by a constant pitch, with at least three different fills.</li>
       <li>The best-scoring line wins. Every slot along it then gets its own row, numbered without gaps. A slot is an ink patch, paper white (a white patch, or nothing drawn), or NU (not used) when it holds a special mark such as a circle, box, tick marks, an image or a label. A tint ladder stacked in one cell stays one slot.</li>
+      <li>If the same core design appears several times along the bar, or on several lines (a step and repeat that fills the sheet), only one core is shown and the repeats are flagged.</li>
       <li>If a QR-style corner mark (three concentric squares in the ratio 7 : 5 : 3) sits in line with the bar, just past one end, the patch next to the mark becomes the first patch and the bar is read away from it. Without a mark, the bar is read left to right, or top to bottom.</li>
     </ol>
     <h2>Limits</h2>

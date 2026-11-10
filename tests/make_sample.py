@@ -16,9 +16,19 @@ Marker cells (for the NU rules) can be added with markers=(...):
   "text_on_patch"   a text label on the patch in slot 1 -> still an ink patch
   "text_gap"        a text label in the empty slot 9    -> NU
   "hairline"        a zero-width tick on the border between slots 7 and 8 -> ignored
+  "labels"          percentage labels printed under the tint patches (K50, S1 25, S1 50, S1 75), all correct
+  "label_wrong"     the same labels, and the C100 patch in slot 2 is labelled "75%" -> the file contradicts itself
   "k60"             the K50 patch in slot 7 is drawn at 60% instead -> tint warning, written as 50% in XML
+  "ladder"          the last slot is a white patch with four stacked tint bars (K 2, 3, 4, 5%) over it,
+                    like the tint ladder in the TCS C4 template -> one slot, never a separate bar
   "second_spot"     the C100 patch in slot 2 is drawn in a second spot ink, which therefore appears
                     before the first spot ink when the bar is read from the left
+
+Step and repeat: repeat=(n, step_mm) draws the whole bar (marks included) n times along its length,
+step_mm apart from start to start, and rows=(m, spacing_mm) draws it on m lines across the sheet.
+as_form=True places the copies as one reusable form XObject, the way a step-and-repeat is usually made.
+The bar is 72 mm long, so step 72 puts the copies end to end on one grid, step 80 leaves two empty
+slots between them, and step 75.5 puts every copy on its own grid.
 
 Optionally a QR-style corner mark (three concentric squares, 7 : 5 : 3) is drawn in line
 with the bar, 3 mm past one end or both: corner_mark="end" | "start" | "both".
@@ -42,12 +52,21 @@ def _sep(name, c1, tint="1"):
             "/C0 [0 0 0 0] /C1 [%s] /N 1 >>]" % (name, c1))
 
 
-def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_mark=None, markers=()):
+def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_mark=None, markers=(),
+              repeat=None, rows=None, as_form=False):
     """Return the bytes of a one-page PDF. Sizes are in mm."""
     if orientation == "horizontal":
         page_w, page_h = 160.0, 70.0
     else:
         page_w, page_h = 70.0, 160.0
+    n_rep, step = repeat or (1, 0.0)
+    n_rows, row_gap = rows or (1, 0.0)
+    if orientation == "horizontal":
+        page_w += (n_rep - 1) * step
+        page_h += (n_rows - 1) * row_gap
+    else:
+        page_h += (n_rep - 1) * step
+        page_w += (n_rows - 1) * row_gap
 
     c = []  # content stream lines
 
@@ -109,12 +128,14 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
         c.append("0 0 0 1 K 0.2 w " + " ".join(ops) + " S")
 
     # --- the real bar -----------------------------------------------------
+    bar_start = len(c)
     if with_bar:
         # (kind, values) per slot; None = empty slot
         group1 = [("k", (0, 0, 0, 1)), ("s2", 1.0) if "second_spot" in markers else ("k", (1, 0, 0, 0)), ("k", (0, 1, 0, 0)), ("k", (0, 0, 1, 0)),
                   ("s", 1.0), ("k", (0.5, 0.4, 0.4, 0)), ("k", (0, 0, 0, 0.6 if "k60" in markers else 0.5)), ("k", (0, 0, 0, 0))]
         group2 = [("k", (0, 0, 0, 1)), ("k", (1, 0, 0, 0)), ("k", (0, 1, 0, 0)), ("k", (0, 0, 1, 0)),
-                  ("s", 1.0), ("s", 0.25), ("s", 0.5), ("s", 0.75)]
+                  ("s", 1.0), ("s", 0.25), ("s", 0.5),
+                  ("k", (0, 0, 0, 0)) if "ladder" in markers else ("s", 0.75)]
         slots = group1 + [None, None] + group2
         x0, y0 = 14.0, 8.0  # bar start (left edge / bottom edge) in mm
         for i, s in enumerate(slots):
@@ -133,8 +154,24 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
         def cell_centre(k):                       # centre of slot k (horizontal samples only)
             return x0 + (k + 0.5) * PATCH_ALONG, y0 + PATCH_ACROSS / 2
 
+        if "labels" in markers or "label_wrong" in markers:
+            def label(slot_index, text):
+                lx = x0 + slot_index * PATCH_ALONG + 0.8
+                c.append("BT /F1 3 Tf 0 g %s %s Td (%s) Tj ET" % (_n(lx * MM), _n((y0 - 2.5) * MM), text))
+            label(6, "50%")
+            label(15, "25%")
+            label(16, "50%")
+            label(17, "75%")
+            if "label_wrong" in markers:
+                label(1, "75%")
+
         for mk in markers:
-            if mk == "circle_gap":
+            if mk == "ladder":
+                lx = x0 + (len(slots) - 1) * PATCH_ALONG
+                for j, tint in enumerate((0.02, 0.03, 0.04, 0.05)):
+                    cmyk(0, 0, 0, tint)
+                    rect(lx, y0 + PATCH_ACROSS - 1.5 * (j + 1), PATCH_ALONG, 1.5)
+            elif mk == "circle_gap":
                 circle(*cell_centre(8), 1.5)
             elif mk == "square_gap":
                 cx, cy = cell_centre(9)
@@ -172,6 +209,24 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
                     a = (top - n * PATCH_ALONG - gap - half) if e == "end" else (top + gap + half)
                     qr_mark(8.0 + centre, a)
 
+    bar_end = len(c)
+
+    # --- step and repeat: the bar's drawing is replayed at each position -------------------
+    form = None
+    if with_bar and (n_rep > 1 or n_rows > 1):
+        bar_lines = c[bar_start:bar_end]
+        del c[bar_start:bar_end]
+        form = "\n".join(bar_lines).encode("latin-1") if as_form else None
+        for r_ in range(n_rows):
+            for k in range(n_rep):
+                dx, dy = ((k * step, r_ * row_gap) if orientation == "horizontal" else (r_ * row_gap, k * step))
+                c.append("q 1 0 0 1 %s %s cm" % (_n(dx * MM), _n(dy * MM)))
+                if as_form:
+                    c.append("/Fm1 Do")
+                else:
+                    c.extend(bar_lines)
+                c.append("Q")
+
     stream = "\n".join(c).encode("latin-1")
 
     objs = {}
@@ -180,10 +235,14 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
     extra = (" /CSspot2 " + _sep("Sample#20Green", "0.93 0 1 0")) if "second_spot" in markers else ""
     res = ("<< /Font << /F1 5 0 R >> /ColorSpace << /CSdie %s /CSall %s /CSspot %s%s >> >>" % (
         _sep("Dieline", "0 1 1 0"), _sep("All", "1 1 1 1"), _sep("Sample#20Orange", "0 0.52 1 0"), extra))
+    page_res = (res[:-3] + " /XObject << /Fm1 6 0 R >> >>") if form is not None else res
     objs[3] = ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents 4 0 R >>" % (
-        _n(page_w * MM), _n(page_h * MM), res)).encode("latin-1")
+        _n(page_w * MM), _n(page_h * MM), page_res)).encode("latin-1")
     objs[4] = b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
     objs[5] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    if form is not None:
+        objs[6] = (b"<< /Type /XObject /Subtype /Form /BBox [-5000 -5000 20000 20000] /Resources %s /Length %d >>\nstream\n"
+                   % (res.encode("latin-1"), len(form))) + form + b"\nendstream"
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = {}

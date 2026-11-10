@@ -25,7 +25,9 @@ How the bar is found
    drawn) or "nu" (not used: it holds a special mark such as a circle, box,
    tick marks, an image or a label). A cell split into parts across its width
    (a tint ladder) stays one slot of kind "split".
-4. If a QR-style corner mark (three concentric squares in the ratio 7 : 5 : 3)
+4. Step and repeat: when the same core design appears several times along the bar (or on several
+   lines), only one core is reported and the repeats are flagged.
+5. If a QR-style corner mark (three concentric squares in the ratio 7 : 5 : 3)
    sits in line with the bar, just past one end, the patch next to the mark
    becomes the first patch and the bar is read away from it.
 """
@@ -40,7 +42,7 @@ from collections import Counter
 from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
-__version__ = "1.5.0"
+__version__ = "1.7.0"
 
 PT2MM = 25.4 / 72.0
 MM2PT = 72.0 / 25.4
@@ -344,11 +346,17 @@ def _simplify_polygon(pts, tol=0.02):
     return pts
 
 
+# rough character widths (fractions of the font size), enough to find the middle of a short label
+_CHAR_WIDTH = {" ": 0.278, "%": 0.889, "+": 0.584, "[": 0.278, "]": 0.278, ".": 0.278, "-": 0.333,
+               **{str(d): 0.556 for d in range(10)}}
+
+
 class Collector:
     def __init__(self, reader):
         self.reader = reader
         self.rects = []  # dicts with x0,y0,x1,y1 (pt, user space) and fill
         self.shapes = []  # everything else that marks the page: curves, outlines, text, images
+        self.texts = []   # the strings written on the page, each with the centre of where it is drawn
         self.stats = Counter()
         self._cs_cache = {}
 
@@ -537,13 +545,20 @@ class Collector:
 
     def _text(self, operands, op, m, font_size):
         n = 0
+        parts = []
         for o in operands:
             if isinstance(o, (str, bytes)):
                 n += len(o)
+                parts.append(o)
             elif isinstance(o, list):
                 n += sum(len(x) for x in o if isinstance(x, (str, bytes)))
+                parts.extend(x for x in o if isinstance(x, (str, bytes)))
         if not n:
             return
+        text = "".join(x if isinstance(x, str) else x.decode("latin-1") for x in parts)
+        width = sum(_CHAR_WIDTH.get(ch, 0.6) for ch in text) * font_size
+        cx, cy = mapply(m, width / 2, 0.3 * font_size)
+        self.texts.append({"s": text, "cx": cx, "cy": cy})
         # rough box: 0.5 em per character wide, ascender and descender in height
         w, h0, h1 = 0.5 * font_size * n, -0.2 * font_size, 0.8 * font_size
         self._add_shape("text", [mapply(m, 0, h0), mapply(m, w, h0), mapply(m, w, h1), mapply(m, 0, h1)])
@@ -758,7 +773,7 @@ def _spot_slots(names):
     return {n: 5 + i for i, n in enumerate(names)}
 
 
-def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=()):
+def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=()):
     axis = ev["axis"]
     members = ev["members"]
     mem_ids = {id(r) for r in members}
@@ -984,8 +999,42 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=()):
     ink_slots = _spot_slots(spot_names)
     spots = [{"label": spot_label[n], "role": ink_role(n), "pdf_name": n, "ink_slot": ink_slots[n]} for n in spot_names]
 
+    # ---- printed percentage labels against the patches under them ---------------------------------
+    # A label such as "75%" printed next to a single-ink patch states that patch's tint. Where the
+    # patch is drawn with another tint the file contradicts itself, so the slot is flagged.
+    labels_at = {}
+    reach = 8 * MM2PT
+    for t in texts:
+        m_ = re.fullmatch(r"\s*(\d{1,3})\s*%\s*", t["s"])
+        if not m_:
+            continue
+        a, _a1, cpos, _c1 = frame({"x0": t["cx"], "x1": t["cx"], "y0": t["cy"], "y1": t["cy"]})
+        if max(0.0, -cpos, cpos - cross_len_pt) > reach:
+            continue                                   # not next to the bar
+        k = int(math.floor((a - phase) / pitch))
+        if 0 <= k < slot_count:
+            labels_at.setdefault(k, []).append(int(m_.group(1)))
+    mismatches = []
+    for k, found_ in labels_at.items():
+        rec = patches[k]
+        if len(set(found_)) != 1 or rec["kind"] != "ink" or len(rec["inks"]) != 1:
+            continue
+        want, ink = found_[0], rec["inks"][0]
+        if ink["tint"] != want:
+            rec["label_pct"] = want
+            rec["detail"] = f"label says {want}%"
+            mismatches.append({"slot": rec["slot"], "label_pct": want, "ink": ink["ink"], "patch_pct": ink["tint"]})
+    mismatches.sort(key=lambda d: d["slot"])
+
     # ---- warnings ------------------------------------------------------------------------------
     warnings = []
+    groups = {}
+    for d in mismatches:
+        groups.setdefault((d["label_pct"], d["ink"], d["patch_pct"]), []).append(d["slot"])
+    for (want, ink, have), sl in groups.items():
+        head = [str(x) for x in sl[:8]]
+        shown = (" and ".join(head) if len(head) <= 2 else ", ".join(head[:-1]) + " and " + head[-1]) + (" and more" if len(sl) > 8 else "")
+        warnings.append(f"The printed label says {want}% but the patch is {ink} {have}% at slot{'s' if len(sl) > 1 else ''} {shown}.")
     for sp in spots:
         if sp["role"] == "coating":
             warnings.append(f"{sp['label']} is a coating plate, not a printing ink. A densitometer usually does not read it, so you may want to leave its patches out of the template.")
@@ -1068,7 +1117,164 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=()):
         "spots": spots,
         "patches": patches,
         "warnings": warnings,
+        "label_mismatches": mismatches,
+        "repeat": None,
+        "_member_slots": {id(r): k for k, r in cell_member.items()},   # private, removed by the caller
     }
+
+
+# --------------------------------------------------------------------------
+# Step and repeat
+# --------------------------------------------------------------------------
+MIN_CORE_SLOTS = 4      # a core design has at least this many slots
+MIN_COPIES = 2          # and has to appear at least this many whole times
+
+
+def _tokens(cand):
+    """One signature per slot, in reading order, for comparing bars and finding repeats."""
+    return ["nu" if p["kind"] == "nu" else "paper" if p["kind"] == "paper" else p["label"]
+            for p in cand["patches"]]
+
+
+def _default_order(cand):
+    """The signatures in the default reading order (left to right, top to bottom)."""
+    toks = _tokens(cand)
+    return toks[::-1] if cand["direction"] in ("right to left", "bottom to top") else toks
+
+
+def find_period(tokens, min_period=MIN_CORE_SLOTS, min_copies=MIN_COPIES):
+    """The smallest P such that tokens[i] == tokens[i + P] all the way along, with at least `min_copies`
+    whole copies of the first P tokens. None when the sequence does not repeat. The last copy may be
+    cut short, because a bar ends at its last patch and does not carry the gap that follows."""
+    n = len(tokens)
+    for period in range(min_period, n // min_copies + 1):
+        if all(tokens[i] == tokens[i + period] for i in range(n - period)):
+            return period
+    return None
+
+
+def split_segments(ev):
+    """Split a line of patches wherever the step to the next patch is not a whole number of pitches.
+
+    Copies stepped by a distance that is not a whole number of patch widths each sit on their own
+    grid, so each one becomes its own segment. Segments of fewer than 4 patches are dropped."""
+    members, key, base = ev["members"], ("x0" if ev["axis"] == "x" else "top"), ev["pitch"]
+    tol = max(0.8, 0.02 * base)
+    segs = [[members[0]]]
+    for a, b in zip(members, members[1:]):
+        step = b[key] - a[key]
+        if abs(step - max(1, round(step / base)) * base) > tol:
+            segs.append([b])
+        else:
+            segs[-1].append(b)
+    return [sg for sg in segs if len(sg) >= 4]
+
+
+def _members_box(members):
+    return (min(r["x0"] for r in members), min(r["y0"] for r in members),
+            max(r["x1"] for r in members), max(r["y1"] for r in members))
+
+
+def _inside(inner, outer, tol=0.5):
+    return (inner[0] >= outer[0] - tol and inner[1] >= outer[1] - tol
+            and inner[2] <= outer[2] + tol and inner[3] <= outer[3] + tol)
+
+
+def build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts=()):
+    """Turn one detected line into candidates, folding step-and-repeat copies into a single core.
+
+    Returns a list of candidates (normally one). A folded candidate has "repeat" set and describes
+    the core design only."""
+    horizontal = ev["axis"] == "x"
+    segs = split_segments(ev)
+    if not segs:
+        return []
+
+    def sub_ev(members):
+        return dict(ev, members=members, conform=1.0, score=len(members) + 2 * len({m["sig"] for m in members}))
+
+    built = [build_candidate(sub_ev(sg), rects, shapes, page_w, page_h, 0, marks, texts) for sg in segs]
+    seg_start = [(sg[0]["x0"] if horizontal else page_h - sg[0]["y1"]) for sg in segs]
+
+    # --- copies on separate grids: all segments must carry the same design --------------------
+    copies_seg, step_seg = 1, None
+    core_i = 0
+    if len(segs) > 1:
+        sigs = [_default_order(b) for b in built]
+        same = all(sigs[i] == sigs[0] or (i == len(sigs) - 1 and sigs[0][:len(sigs[i])] == sigs[i])
+                   for i in range(1, len(sigs)))
+        if same and len(sigs[0]) >= MIN_CORE_SLOTS:
+            copies_seg = len(segs)
+            steps = [b - a for a, b in zip(seg_start, seg_start[1:])]
+            step_seg = statistics.median(steps) * PT2MM
+            # read the core the way the bar is meant to be read: from a corner mark when one is in line
+            marked = [i for i, b in enumerate(built) if b["reference"] == "corner mark"]
+            core_i = marked[0] if marked else 0
+        else:
+            out = []                                   # different designs on one line: keep them apart
+            for sg, b in zip(segs, built):
+                b.pop("_member_slots", None)
+                b["_rects"] = len(sg)
+                out.append(b)
+            return out
+
+    core, core_members = built[core_i], segs[core_i]
+
+    # --- copies on the same grid: the slot sequence itself repeats -------------------------------
+    n = len(core["patches"])
+    period = find_period(_tokens(core))
+    copies_grid, partial_last, on_grid, step_grid = 1, False, False, None
+    if period:
+        slot_of = core["_member_slots"]
+        keep = [m for m in core_members if slot_of.get(id(m), 10 ** 9) < period]
+        if len(keep) >= MIN_CORE_SLOTS:
+            full = core
+            core = build_candidate(sub_ev(keep), rects, shapes, page_w, page_h, 0, marks, texts)
+            core_slots = core["slot_count"]
+            copies_grid = -(-n // period)                           # ceil(n / period)
+            partial_last = (n - (copies_grid - 1) * period) < core_slots
+            on_grid = True
+            step_grid = period * full["pitch_mm"]
+    core.pop("_member_slots", None)
+
+    copies = copies_seg * copies_grid
+    if copies > 1:
+        total_len = ((ev["members"][-1]["x1"] - ev["members"][0]["x0"]) if horizontal
+                     else (max(m["y1"] for m in ev["members"]) - min(m["y0"] for m in ev["members"]))) * PT2MM
+        core["repeat"] = {
+            "found": True,
+            "copies_along": copies,
+            "copies_across": 1,
+            "period_slots": core["slot_count"],
+            "core_length_mm": core["length_mm"],
+            "full_length_mm": round(total_len, 2),
+            "step_mm": round(step_grid if (copies_grid > 1 and copies_seg == 1) else (step_seg if step_seg else step_grid), 3),
+            "partial_last": partial_last,
+            "on_grid": on_grid and copies_seg == 1,
+        }
+    core["_rects"] = len(ev["members"])
+    return [core]
+
+
+def _merge_identical_lines(cands):
+    """Identical bars on different lines are one design stepped across the sheet: keep the first."""
+    out, seen = [], {}
+    for c in cands:
+        key = (c["orientation"], round(c["patch_w_mm"], 2), round(c["patch_h_mm"], 2), round(c["pitch_mm"], 2),
+               tuple(_default_order(c)))
+        if key in seen:
+            keeper = seen[key]
+            rep_ = keeper["repeat"] or {
+                "found": True, "copies_along": 1, "copies_across": 1, "period_slots": keeper["slot_count"],
+                "core_length_mm": keeper["length_mm"], "full_length_mm": keeper["length_mm"], "step_mm": None,
+                "partial_last": False, "on_grid": False}
+            rep_["copies_across"] += 1
+            keeper["repeat"] = rep_
+            keeper["_rects"] += c["_rects"]
+            continue
+        seen[key] = c
+        out.append(c)
+    return out
 
 
 def _open(source):
@@ -1121,23 +1327,35 @@ def analyze(source, name=None):
         sh["y0"] -= lly
         sh["y1"] -= lly
         shapes.append(sh)
+    texts = [dict(t, cx=t["cx"] - llx, cy=t["cy"] - lly) for t in col.texts]
     marks = find_corner_marks(rects)
     found = find_bars(rects, page_w, page_h)
     if not found:
         found = find_bars(rects, page_w, page_h, include_rgb=True)
 
-    candidates, used = [], []
+    pending, used, covered = [], [], []
     for ev in found:
-        # skip lines that are mostly the same shapes as a better one
         ids = {id(m) for m in ev["members"]}
         if any(len(ids & u) > 0.5 * len(ids) for u in used):
-            continue
+            continue                                   # mostly the same shapes as a better line
+        box = _members_box(ev["members"])
+        if any(_inside(box, cv) for cv in covered):
+            continue                                   # a part of a bar, such as a tint ladder stacked in one cell
         used.append(ids)
-        candidates.append(build_candidate(ev, rects, shapes, page_w, page_h, len(candidates), marks))
-        if len(candidates) >= 4:
+        built = build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts)
+        if built:
+            covered.append(box)
+            pending.extend(built)
+        if len(pending) >= 12:
             break
+    candidates = _merge_identical_lines(pending)[:4]
+    for i, cnd in enumerate(candidates):
+        cnd["id"] = i
 
-    bar_shapes = sum(c["counts"]["ink"] + c["counts"]["paper"] for c in candidates[:1])
+    bar_shapes = candidates[0].pop("_rects", 0) if candidates else 0
+    for cnd in candidates:
+        cnd.pop("_rects", None)
+        cnd.pop("_member_slots", None)
     ignored = {
         "images": col.stats["images"],
         "text_runs": col.stats["text"],
@@ -1145,6 +1363,8 @@ def analyze(source, name=None):
         "production_ink_rectangles": production,
         "corner_marks": len(marks),
         "other_rectangles": max(0, len(rects) - production - bar_shapes - sum(len(m["rects"]) for m in marks)),
+        "repeated_copies": ((candidates[0]["repeat"]["copies_along"] * candidates[0]["repeat"]["copies_across"] - 1)
+                            if candidates and candidates[0].get("repeat") else 0),
     }
     result = {
         "file": os.path.basename(str(name)),
@@ -1194,7 +1414,7 @@ def _num(v):
     return f"{v:.3f}".rstrip("0").rstrip(".") or "0"
 
 
-def _xml_patch(p, slot_of, notes):
+def _xml_patch(p, slot_of, notes, use_labels=True):
     """The template ID and definition for one slot record."""
     kind = p["kind"]
     if kind == "split":
@@ -1209,19 +1429,30 @@ def _xml_patch(p, slot_of, notes):
     if len(inks) == 1:
         i = inks[0]
         t, s_, slot = i["tint"], sym(i), slot_of[i["ink"]]
+        followed = None
+        lp = p.get("label_pct")
+        if use_labels and lp is not None and (lp in STD_TINTS or lp == 100) and lp != t:
+            followed = (p["slot"], lp, i["ink"], t)
+            t = lp
         if t == 100:
-            return f"P_{s_}", {"type": "Solid", "ptd": {"Slot": str(slot)}}
-        near = min(STD_TINTS, key=lambda k: abs(k - t))
-        if abs(near - t) <= TINT_SNAP:
-            letter, cls = STD_TINTS[near]
-            if near != t:
-                notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is written as {near}% (P_{letter}{s_}), "
-                             f"because the tints are 25, 50 and 75%.")
-            return f"P_{letter}{s_}", {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(near / 100),
-                                                                "RasterClass": str(cls)}}
-        notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is not a 25, 50 or 75% tint, so it is written as its "
-                     f"own tint (P_{t}{s_}) without a RasterClass.")
-        return f"P_{t}{s_}", {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(t / 100)}}
+            pid, d = f"P_{s_}", {"type": "Solid", "ptd": {"Slot": str(slot)}}
+        else:
+            near = min(STD_TINTS, key=lambda k: abs(k - t))
+            if abs(near - t) <= TINT_SNAP:
+                letter, cls = STD_TINTS[near]
+                pid = f"P_{letter}{s_}"
+                d = {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(near / 100), "RasterClass": str(cls)}}
+                if near != t:
+                    notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is written as {near}% ({pid}), "
+                                 f"because the tints are 25, 50 and 75%.")
+            else:
+                pid = f"P_{t}{s_}"
+                d = {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(t / 100)}}
+                notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is not a 25, 50 or 75% tint, so it is written as its "
+                             f"own tint ({pid}) without a RasterClass.")
+        if followed:
+            notes.append(("follow",) + followed + (pid,))      # grouped into one note per kind by build_xml
+        return pid, d
     tints = tuple(i["tint"] for i in inks)
     if all(t == 100 for t in tints):
         return "P_" + "".join(sym(i) for i in inks), {
@@ -1240,17 +1471,35 @@ def _xml_patch(p, slot_of, notes):
          {"Slot": str(slot_of[i["ink"]]), "Raster": _g(i["tint"] / 100), "Type": "Tint"}) for i in inks]}
 
 
-def build_xml(result, cand):
-    """-> (xml text, notes). Notes list anything that was adjusted or could not be matched exactly."""
+def build_xml(result, cand, use_labels=True):
+    """-> (xml text, notes). Notes list anything that was adjusted or could not be matched exactly.
+
+    use_labels: where a printed percentage label disagrees with the tint drawn in the patch, write the
+    label's value (the default) or keep the patch as drawn."""
     notes = []
     slot_of = dict(PROCESS_SLOT)
     for sp in cand["spots"]:
         slot_of[sp["label"]] = sp["ink_slot"]
     ids, defs = [], {}
     for p in cand["patches"]:
-        pid, d = _xml_patch(p, slot_of, notes)
+        pid, d = _xml_patch(p, slot_of, notes, use_labels)
         ids.append(pid)
         defs.setdefault(pid, d)
+
+    follow, plain = {}, []
+    for n in notes:
+        if isinstance(n, tuple):
+            _, slot, want, ink, have, pid = n
+            follow.setdefault((want, ink, have, pid), []).append(slot)
+        else:
+            plain.append(n)
+    for (want, ink, have, pid), sl in follow.items():
+        many = len(sl) > 1
+        names = [str(x) for x in sl]
+        where = " and ".join(names) if len(names) <= 2 else ", ".join(names[:-1]) + " and " + names[-1]
+        plain.append(f"Slot{'s' if many else ''} {where}: the printed label says {want}% but the patch is {ink} {have}%, "
+                     f"so {'they are' if many else 'it is'} written as {want}%, following the label ({pid}).")
+    notes = plain
 
     stem = os.path.splitext(os.path.basename(str(result.get("file", "") or "ColorBar")))[0]
     root = ET.Element("ColorBar", {"Name": stem.replace("_", " ")})
@@ -1274,8 +1523,8 @@ def build_xml(result, cand):
     return '<?xml version="1.0"?>\n' + ET.tostring(root, encoding="unicode") + "\n", notes
 
 
-def candidate_xml(result, cand):
-    return build_xml(result, cand)[0]
+def candidate_xml(result, cand, use_labels=True):
+    return build_xml(result, cand, use_labels)[0]
 
 
 def analyze_for_web(source, name=None):
@@ -1284,4 +1533,6 @@ def analyze_for_web(source, name=None):
     res["engine_version"] = __version__
     for c in res["candidates"]:
         c["xml"], c["xml_notes"] = build_xml(res, c)
+        if c["label_mismatches"]:                       # offer the other reading as well
+            c["xml_as_drawn"], c["xml_as_drawn_notes"] = build_xml(res, c, use_labels=False)
     return res

@@ -6,7 +6,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 
 const PDFJS_BASE = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/";
 
-const S = { res: null, sel: 0, tab: "ext", file: null, pdfDoc: null, crops: new Map(), zoomUser: false, zoomVal: 4, seconds: 0 };
+const S = { useLabels: true, res: null, sel: 0, tab: "ext", file: null, pdfDoc: null, crops: new Map(), zoomUser: false, zoomVal: 4, seconds: 0 };
 
 // ---- link to the source repo when hosted on GitHub Pages ------------------------------------
 (() => {
@@ -115,7 +115,7 @@ async function run(file) {
     const buf = await file.arrayBuffer();
     const res = await request({ type: "analyze", buffer: buf, name: file.name }, [buf]);
     S.seconds = (performance.now() - t0) / 1000;
-    S.res = res; S.sel = 0; S.file = file; S.zoomUser = false; S.tab = "ext";
+    S.res = res; S.sel = 0; S.file = file; S.zoomUser = false; S.tab = "ext"; S.useLabels = true;
     res.file = file.name;
     drop.classList.add("compact");
     $("#dropInner").innerHTML = "<span><strong>" + esc(file.name) + "</strong> &nbsp; " + res.page.w_mm + " × " + res.page.h_mm + " mm</span><span>Choose another PDF</span>";
@@ -133,6 +133,17 @@ async function run(file) {
 
 // ---- results ----------------------------------------------------------------------------------
 const cand = () => S.res.candidates[S.sel];
+
+function repeatText(r) {
+  const parts = [];
+  if (r.copies_along > 1) {
+    parts.push("repeats " + r.copies_along + " times along the bar, " + fmt(r.full_length_mm, 1) + " mm in all, every " +
+      fmt(r.step_mm, 1) + " mm" + (r.on_grid ? " (a whole number of slots)" : "") + (r.partial_last ? "; the last copy is cut short" : ""));
+  }
+  if (r.copies_across > 1) parts.push("appears on " + r.copies_across + " lines");
+  return "The core design (" + r.period_slots + " slots, " + fmt(r.core_length_mm, 1) + " mm) " + parts.join(" and ") +
+    ". Only one core is shown and exported.";
+}
 
 function download(name, text, type) {
   const a = document.createElement("a");
@@ -160,6 +171,7 @@ function render() {
   h += "<dt>Corner mark</dt><dd>" + (c.corner_mark ? (c.corner_mark.applied ? "Found, sets slot 1" : "Found at the start") : "None") + "</dd>";
   h += "<dt>Pitch</dt><dd>" + fmt(c.pitch_mm) + " mm</dd>";
   h += "<dt>Slots</dt><dd>" + c.slot_count + "</dd>";
+  if (c.repeat) h += "<dt>Repeats</dt><dd>" + (c.repeat.copies_along * c.repeat.copies_across) + " copies of this core</dd>";
   h += "<dt>Ink patches</dt><dd>" + c.counts.ink + "</dd>";
   h += "<dt>Paper white</dt><dd>" + c.counts.paper + "</dd>";
   h += "<dt>NU (not used)</dt><dd>" + c.counts.nu + "</dd>";
@@ -169,19 +181,27 @@ function render() {
   h += "<dt>Page size</dt><dd>" + S.res.page.w_mm + " × " + S.res.page.h_mm + " mm</dd>";
   h += "<dt>Analysis time</dt><dd>" + fmt(S.seconds, 1) + " s</dd>";
   h += "</dl>";
+  if (c.repeat) h += '<p class="repeatNote"><b>Step and repeat found.</b> ' + esc(repeatText(c.repeat)) + "</p>";
   c.warnings.forEach((w) => (h += '<div class="warn">' + esc(w) + "</div>"));
   if (S.res.candidates.length > 1) {
     h += '<div class="cands"><label for="cs">More than one bar was found</label><select id="cs">';
     S.res.candidates.forEach((k, i) => (h += '<option value="' + i + '"' + (i === S.sel ? " selected" : "") + ">Bar " + (i + 1) + ": " + k.slot_count + " slots, " + fmt(k.patch_w_mm) + " × " + fmt(k.patch_h_mm) + " mm</option>"));
     h += "</select></div>";
   }
-  (c.xml_notes || []).forEach((n) => (h += '<div class="warn">XML: ' + esc(n) + "</div>"));
+  const asDrawn = c.xml_as_drawn && !S.useLabels;
+  if (c.xml_as_drawn) {
+    h += '<label class="opt"><input type="checkbox" id="useLabels"' + (S.useLabels ? " checked" : "") + "> " +
+      "Follow the printed labels where they disagree with the patches (" +
+      c.label_mismatches.map((d) => "slot " + d.slot).join(", ") + ")</label>";
+  }
+  (asDrawn ? c.xml_as_drawn_notes : c.xml_notes || []).forEach((n) => (h += '<div class="warn">XML: ' + esc(n) + "</div>"));
   h += '<div class="btnrow"><button class="btn" id="dlXml">Download XML</button></div>';
   const ig = S.res.ignored;
   h += "<details><summary>What was ignored</summary><ul>";
   h += "<li>" + ig.images + " images</li><li>" + ig.text_runs + " text runs</li>";
   h += "<li>" + ig.curved_or_irregular_shapes + " curved or irregular shapes</li>";
   h += "<li>" + ig.production_ink_rectangles + " rectangles in production inks (dieline, registration, cut)</li>";
+  if (ig.repeated_copies) h += "<li>" + ig.repeated_copies + " further cop" + (ig.repeated_copies > 1 ? "ies" : "y") + " of the core design</li>";
   if (ig.corner_marks) h += "<li>" + ig.corner_marks + " corner mark" + (ig.corner_marks > 1 ? "s" : "") + "</li>";
   h += "<li>" + ig.other_rectangles + " other rectangles that do not form a bar</li></ul></details>";
   h += "</div>";
@@ -189,7 +209,10 @@ function render() {
 
   const cs = $("#cs");
   if (cs) cs.onchange = () => { S.sel = +cs.value; S.zoomUser = false; render(); };
-  $("#dlXml").onclick = () => download("colorbar_" + S.res.file.replace(/\.pdf$/i, "") + ".xml", cand().xml, "application/xml");
+  const ul = $("#useLabels");
+  if (ul) ul.onchange = () => { S.useLabels = ul.checked; render(); };
+  $("#dlXml").onclick = () => download("colorbar_" + S.res.file.replace(/\.pdf$/i, "") + ".xml",
+    (cand().xml_as_drawn && !S.useLabels) ? cand().xml_as_drawn : cand().xml, "application/xml");
   fillTable();
   setTab(S.tab);
 }
@@ -306,6 +329,7 @@ function drawBar() {
   if (c.direction === "right to left") cap += " The bar is read from right to left, so the preview is mirrored to start at slot 1.";
   if (c.direction === "bottom to top") cap += " The bar is read from the bottom up, so slot 1 is at the left.";
   if (c.direction === "top to bottom" && !horizontal) cap += " Slot 0 is the top patch.";
+  if (c.repeat) cap += " Only the core design is shown; the repeats are left out.";
   $("#cap").textContent = cap;
 }
 
