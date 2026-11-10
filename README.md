@@ -230,27 +230,5 @@ python tools/build_site.py
 python -m pytest -q tests/e2e
 ```
 
-### Changing the pinned versions
 
-The versions are constants at the top of `site/worker.js` (Pyodide) and in
-`requirements.txt` plus `PYPDF_REQUIREMENT` in `site/worker.js` (pypdf), and
-`PDFJS_BASE` in `site/app.js` (pdf.js). Change them together, then run the browser test.
-Pyodide 314 and later only supports module workers, which is why `worker.js` is an ES module.
 
-## Publishing on GitHub Pages
-
-1. Create an empty public repository on GitHub and push this code to `main`.
-2. In the repository go to **Settings > Pages**, and under **Build and deployment**
-   set **Source** to **GitHub Actions**.
-3. Open the **Actions** tab, choose **Deploy site**, and run it (or push a commit).
-   The page appears at `https://YOUR-USERNAME.github.io/REPOSITORY-NAME/`.
-
-## Please do not commit customer files
-
-Press-sheet PDFs usually contain customer artwork. `.gitignore` excludes all PDFs
-except the synthetic sample. Test with your own files in the browser or on the
-command line, and keep them out of the repository.
-
-## License
-
-MIT. See [LICENSE](LICENSE). Replace `YOUR NAME` in that file with your own.
