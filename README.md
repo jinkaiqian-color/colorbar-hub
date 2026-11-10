@@ -5,7 +5,6 @@ Find the linear color bar in a press-sheet PDF, get the **patch size** and the
 template in color control software, so the system knows how to map measurement data to each patch.
 
 **Live page:** `https://jinkaiqian-color.github.io/colorbar-hub/`
-(available after you enable GitHub Pages, see [Publishing](#publishing-on-github-pages))
 
 ![The page analyzing the bundled sample sheet](docs/screenshot.png)
 
