@@ -4,7 +4,7 @@ Find the linear color bar in a press-sheet PDF, get the **patch size** and the
 **patch map** in millimetres, and export the bar as **XML**. Built for recreating a color bar
 template in color control software, so the system knows how to map measurement data to each patch.
 
-**Live page:** `https://YOUR-USERNAME.github.io/colorbar-hub/`
+**Live page:** `https://jinkaiqian-color.github.io/colorbar-hub/`
 (available after you enable GitHub Pages, see [Publishing](#publishing-on-github-pages))
 
 ![The page analyzing the bundled sample sheet](docs/screenshot.png)
