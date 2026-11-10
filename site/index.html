@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>colorbar-hub</title>
+<meta name="description" content="Find the linear color bar in a press-sheet PDF, get the patch size and patch map in millimetres, and export the bar as XML. Runs entirely in your browser.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='8' height='32' fill='%2300aeef'/%3E%3Crect x='8' width='8' height='32' fill='%23ec008c'/%3E%3Crect x='16' width='8' height='32' fill='%23fff200'/%3E%3Crect x='24' width='8' height='32' fill='%23231f20'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="head-row">
+    <h1>colorbar-hub</h1>
+    <a id="repo" class="repo" href="#" hidden>Source on GitHub</a>
+  </div>
+  <p>Drop a press-sheet PDF. The page finds the linear color bar, ignores the rest of the sheet, reports the patch size and patch map in millimetres, and exports the bar as XML.</p>
+  <p class="privacy">Your PDF is read inside this browser tab and is never uploaded. The page downloads the Python engine and the PDF library from public CDNs when it opens.</p>
+</header>
+
+<noscript><p class="nojs">This page needs JavaScript to run the PDF engine.</p></noscript>
+
+<main>
+  <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose a PDF">
+    <div id="dropInner">
+      <strong>Drop a PDF here, or click to choose one</strong>
+      <span>Large press sheets are fine. The first analysis can take a minute on a very large file.</span>
+    </div>
+  </div>
+  <input id="file" type="file" accept="application/pdf,.pdf" hidden>
+
+  <div class="under-drop">
+    <button id="sample" class="link" type="button">Try the sample sheet</button>
+    <span id="engine" class="engine" role="status">Starting the engine</span>
+  </div>
+
+  <div id="busy" role="status"><span class="bar-anim"></span><span id="busyText">Reading the PDF</span></div>
+  <div id="error" role="alert"></div>
+
+  <section id="out" aria-live="polite">
+    <div class="card" id="summary"></div>
+    <div>
+      <div class="card" id="viewer">
+        <div class="tabs" role="tablist">
+          <button class="tab" role="tab" id="tab-ext" aria-selected="true">Extracted bar</button>
+          <button class="tab" role="tab" id="tab-ren" aria-selected="false">Rendered from the PDF</button>
+          <label class="zoom" id="zoomWrap">Zoom <input id="zoom" type="range" min="1" max="14" step="0.5" value="4"></label>
+        </div>
+        <div class="stage" id="stage"></div>
+        <p class="cap" id="cap"></p>
+      </div>
+      <div class="card" style="margin-top:20px">
+        <h2>Patch map</h2>
+        <div class="tbl"><table id="tbl"><thead><tr>
+          <th class="n">Slot</th><th class="n">Offset along bar (mm)</th><th class="n">Width × height (mm)</th><th>Composition</th>
+        </tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="about">
+    <h2>How the bar is found</h2>
+    <ol>
+      <li>Every filled rectangle is collected with its size, position and ink. Images, text, curved shapes and shapes in production inks (dieline, registration, cut) are set aside.</li>
+      <li>Rectangles of the same size are grouped. A color bar is a group on one straight line, advancing by a constant pitch, with at least three different fills.</li>
+      <li>The best-scoring line wins. Every slot along it then gets its own row, numbered without gaps. A slot is an ink patch, paper white (a white patch, or nothing drawn), or NU (not used) when it holds a special mark such as a circle, box, tick marks, an image or a label. A tint ladder stacked in one cell stays one slot.</li>
+      <li>If a QR-style corner mark (three concentric squares in the ratio 7 : 5 : 3) sits in line with the bar, just past one end, the patch next to the mark becomes the first patch and the bar is read away from it. Without a mark, the bar is read left to right, or top to bottom.</li>
+    </ol>
+    <h2>Limits</h2>
+    <p>The bar has to be live vector artwork. A bar placed as an image, or converted to outlines, cannot be read. Spot colors are labeled S1, S2 and so on in order of appearance, and their preview colors are approximate. Rotated pages are reported in unrotated page coordinates.</p>
+  </section>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
