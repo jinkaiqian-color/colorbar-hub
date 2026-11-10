@@ -36,7 +36,7 @@ def test_horizontal_bar_size_and_slots():
     assert c["orientation"] == "horizontal"
     assert approx(c["patch_w_mm"], 4.0) and approx(c["patch_h_mm"], 6.0) and approx(c["pitch_mm"], 4.0)
     assert c["slot_count"] == 18 and c["patch_count"] == 18
-    assert c["counts"] == {"ink": 15, "paper": 3, "nu": 0}
+    assert c["counts"] == {"ink": 15, "paper": 3, "nu": 0, "sd": 0}
     assert c["empty_slots"] == [9, 10]                 # slots are numbered from 1
     assert approx(c["origin_mm"]["x"], 14.0, 0.05)
     assert c["warnings"] == []
@@ -272,7 +272,7 @@ def test_a_marker_in_an_empty_slot_is_nu_and_its_neighbour_stays_paper():
     assert kinds(c)[8] == "nu" and labels(c)[8] == "NU"
     assert "curve" in c["patches"][8]["detail"]
     assert kinds(c)[9] == "paper"
-    assert c["counts"] == {"ink": 15, "paper": 2, "nu": 1}
+    assert c["counts"] == {"ink": 15, "paper": 2, "nu": 1, "sd": 0}
 
 
 def test_a_marker_of_a_different_size_is_nu_not_paper():
@@ -579,3 +579,77 @@ def test_a_label_over_a_patch_with_several_inks_is_not_compared():
     c = one(orientation="horizontal", markers=("labels",))
     assert c["patches"][5]["kind"] == "ink" and len(c["patches"][5]["inks"]) == 3
     assert c["patches"][5].get("label_pct") is None
+
+
+# ---- slur / doubling (line) patches ------------------------------------------------------------------
+
+def test_a_cell_of_parallel_lines_is_an_sd_patch_not_paper_white():
+    c = one(orientation="horizontal", markers=("sd_pair",))
+    v, h = c["patches"][8], c["patches"][9]
+    assert (v["slot"], v["kind"], v["label"]) == (9, "lines", "S/D vertical lines K100")
+    assert (h["slot"], h["kind"], h["label"]) == (10, "lines", "S/D horizontal lines K100")
+    assert v["lines"]["direction"] == "vertical" and v["lines"]["count"] == 16
+    assert h["lines"]["direction"] == "horizontal" and h["lines"]["count"] == 24
+    assert approx(v["lines"]["width_mm"], 0.125, 0.002) and approx(v["lines"]["pitch_mm"], 0.25, 0.005)
+    assert v["inks"] == [{"ink": "K", "tint": 100}] and v["empty"] is False and v["paper"] is False
+    assert c["counts"] == {"ink": 15, "paper": 1, "nu": 0, "sd": 2}
+    assert c["empty_slots"] == []
+
+
+def test_too_few_lines_are_not_a_patch():
+    c = one(orientation="horizontal", markers=("few_lines",))
+    assert c["counts"]["sd"] == 0 and c["patches"][8]["kind"] == "paper"
+
+
+def test_the_xml_writes_sd_patches_as_slur_patches_with_the_template_ids():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal", markers=("sd_pair",))
+    root = ET.fromstring(c["xml"])
+    seq = [t.get("rRef") for t in root.find("TemplatePatches")]
+    assert seq[8:10] == ["P_0\u00b0K", "P_90\u00b0K"]
+    d = {t.get("ID"): (t.get("Type"), t.find("PatchTypeData").attrib) for t in root.find("ReferencePatches")}
+    assert d["P_0\u00b0K"] == ("Slur", {"Slot": "1", "Type": "Vertical"})
+    assert d["P_90\u00b0K"] == ("Slur", {"Slot": "1", "Type": "Horizontal"})
+    assert '<TemplatePatch Type="Slur" ID="P_0\u00b0K">\n\t\t\t<PatchTypeData Slot="1" Type="Vertical" />' in c["xml"]
+    assert c["xml_notes"] == []
+
+
+def test_sd_patches_in_a_spot_ink_use_the_spot_ink_slot():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal", markers=("sd_pair_spot",))
+    assert c["patches"][8]["label"] == "S/D vertical lines S1 100"
+    root = ET.fromstring(c["xml"])
+    d = {t.get("ID"): t.find("PatchTypeData").attrib for t in root.find("ReferencePatches")}
+    assert d["P_0\u00b01"] == {"Slot": "5", "Type": "Vertical"} and d["P_90\u00b01"] == {"Slot": "5", "Type": "Horizontal"}
+
+
+def test_sd_patches_keep_their_physical_direction_when_the_bar_is_read_from_the_other_end():
+    c = one(orientation="horizontal", markers=("sd_pair",), corner_mark="end")
+    assert c["direction"] == "right to left"
+    assert [(p["slot"], p["lines"]["direction"]) for p in c["patches"] if p["kind"] == "lines"] == [
+        (9, "horizontal"), (10, "vertical")]                       # the order flips, the lines do not
+
+
+def test_sd_patches_are_found_on_a_vertical_bar_too():
+    c = one(orientation="vertical", markers=("sd_pair",))
+    assert [(p["slot"], p["lines"]["direction"]) for p in c["patches"] if p["kind"] == "lines"] == [
+        (9, "vertical"), (10, "horizontal")]
+
+
+def test_a_repeated_bar_with_sd_patches_folds_to_the_same_core_and_xml():
+    single = one(orientation="horizontal", markers=("sd_pair",))
+    for kw in ({"repeat": (3, 72.0)}, {"repeat": (3, 75.5)}, {"repeat": (3, 75.5), "as_form": True}):
+        c = one(orientation="horizontal", markers=("sd_pair",), **kw)
+        assert c["repeat"]["copies_along"] == 3 and c["counts"]["sd"] == 2 and c["xml"] == single["xml"], kw
+
+
+def test_thin_tick_lines_are_not_sd_patches():
+    # the hairline tick between slots 7 and 8 and the ordinary decoy shapes must not become patches
+    c = one(orientation="horizontal", markers=("hairline",))
+    assert c["counts"]["sd"] == 0
+
+
+def test_patch_dimensions_in_the_xml_are_rounded_to_the_nearest_half_micrometre():
+    assert core._dim(4.0623) == "4.0625" and core._dim(4.0627) == "4.0625" and core._dim(4.06) == "4.06"
+    assert core._dim(3.0) == "3" and core._dim(2.9999) == "3" and core._dim(5.0001) == "5"
+    assert core._dim(9.525) == "9.525" and core._dim(6.0001) == "6"

@@ -175,6 +175,7 @@ function render() {
   h += "<dt>Ink patches</dt><dd>" + c.counts.ink + "</dd>";
   h += "<dt>Paper white</dt><dd>" + c.counts.paper + "</dd>";
   h += "<dt>NU (not used)</dt><dd>" + c.counts.nu + "</dd>";
+  if (c.counts.sd) h += "<dt>S/D patches</dt><dd>" + c.counts.sd + "</dd>";
   h += "<dt>Bar length</dt><dd>" + fmt(c.length_mm, 2) + " mm</dd>";
   h += "<dt>Bar starts, from left</dt><dd>" + fmt(c.start_mm.x, 2) + " mm</dd>";
   h += "<dt>Bar starts, from top</dt><dd>" + fmt(c.start_mm.y, 2) + " mm</dd>";
@@ -224,7 +225,9 @@ function fillTable() {
     const tr = document.createElement("tr");
     tr.dataset.i = i;
     if (p.kind === "nu") tr.className = "nu";
-    const sw = p.kind === "nu" ? '<span class="sw nu"></span>' : '<span class="sw" style="background:' + p.rgb + '"></span>';
+    const sw = p.kind === "nu" ? '<span class="sw nu"></span>'
+      : p.kind === "lines" ? '<span class="sw" style="background:repeating-linear-gradient(90deg,' + p.rgb + ' 0 1px,#fff 1px 3px)"></span>'
+      : '<span class="sw" style="background:' + p.rgb + '"></span>';
     tr.innerHTML = '<td class="n">' + p.slot + "</td>" +
       '<td class="n">' + fmt(p.along_mm) + "</td>" +
       '<td class="n">' + fmt(p.w_mm) + " × " + fmt(p.h_mm) + "</td>" +
@@ -284,10 +287,19 @@ function drawBar() {
        '<rect width="6" height="6" fill="#eceff2"/><line x1="0" y1="0" x2="0" y2="6" stroke="#aab2bc" stroke-width="2"/></pattern></defs>';
   c.patches.forEach((p, i) => {
     const x = ox + p.along_mm * sc, y = oy + p.cross_mm * sc, w = p.len_mm * sc, h = p.thick_mm * sc;
-    const fill = p.kind === "nu" ? "url(#nuhatch)" : p.rgb;
+    const fill = p.kind === "nu" ? "url(#nuhatch)" : p.kind === "lines" ? "#ffffff" : p.rgb;
     const stroke = p.kind === "paper" && p.empty ? "#9aa4af" : "rgba(0,0,0,.35)";
     const dash = p.kind === "paper" && p.empty ? ' stroke-dasharray="4 3"' : "";
     s += '<rect id="p' + i + '" x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" fill="' + fill + '" stroke="' + stroke + '" stroke-width="0.8"' + dash + '><title>' + esc("slot " + p.slot + ": " + p.label + (p.detail ? " (" + p.detail + ")" : "")) + "</title></rect>";
+    if (p.kind === "lines" && p.lines) {                       // S/D patch: draw its real lines
+      const L = p.lines, wpx = Math.max(0.7, L.width_mm * sc);
+      for (let i = 0; i < L.count; i++) {
+        const pos = (L.first_mm + i * L.pitch_mm) * sc;
+        s += L.frame_dir === "across"
+          ? '<rect x="' + (x + pos - wpx / 2) + '" y="' + y + '" width="' + wpx + '" height="' + h + '" fill="' + p.rgb + '" pointer-events="none"/>'
+          : '<rect x="' + x + '" y="' + (oy + pos - wpx / 2) + '" width="' + w + '" height="' + wpx + '" fill="' + p.rgb + '" pointer-events="none"/>';
+      }
+    }
     p.parts.forEach((q) => {
       s += '<rect x="' + (ox + q.along_mm * sc) + '" y="' + (oy + q.cross_mm * sc) + '" width="' + q.len_mm * sc + '" height="' + q.thick_mm * sc + '" fill="' + q.rgb + '" stroke="rgba(0,0,0,.25)" stroke-width="0.6" pointer-events="none"><title>' + esc(q.label) + "</title></rect>";
     });
@@ -324,7 +336,7 @@ function drawBar() {
   s += "</svg>";
   stage.innerHTML = s;
   let cap = horizontal
-    ? "Patches are drawn to scale from the vector data in the PDF. Dimensions are in mm. Hatched cells are NU (not used). Dashed boxes are slots with nothing drawn. Scroll sideways or use Zoom on a long bar."
+    ? "Patches are drawn to scale from the vector data in the PDF. Dimensions are in mm. Hatched cells are NU (not used). Dashed boxes are slots with nothing drawn. S/D patches show their lines. Scroll sideways or use Zoom on a long bar."
     : "This bar is vertical on the sheet. It is shown turned on its side so it fits the screen. Dimensions are in mm. Hatched cells are NU (not used). Dashed boxes are slots with nothing drawn.";
   if (c.direction === "right to left") cap += " The bar is read from right to left, so the preview is mirrored to start at slot 1.";
   if (c.direction === "bottom to top") cap += " The bar is read from the bottom up, so slot 1 is at the left.";

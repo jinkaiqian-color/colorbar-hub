@@ -25,7 +25,7 @@ def print_summary(res):
           + ("  (across x along the strip)" if vertical else "  (width x height)"))
     print(f"  Pitch:      {c['pitch_mm']:.3f} mm")
     n = c["counts"]
-    print(f"  Slots:      {c['slot_count']}  (ink {n['ink']}, paper white {n['paper']}, NU {n['nu']})")
+    print(f"  Slots:      {c['slot_count']}  (ink {n['ink']}, paper white {n['paper']}, NU {n['nu']}, S/D {n.get('sd', 0)})")
     print(f"  Length:     {c['length_mm']:.2f} mm")
     m = c.get("corner_mark")
     if m:

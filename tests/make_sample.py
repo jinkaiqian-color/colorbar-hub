@@ -19,6 +19,10 @@ Marker cells (for the NU rules) can be added with markers=(...):
   "labels"          percentage labels printed under the tint patches (K50, S1 25, S1 50, S1 75), all correct
   "label_wrong"     the same labels, and the C100 patch in slot 2 is labelled "75%" -> the file contradicts itself
   "k60"             the K50 patch in slot 7 is drawn at 60% instead -> tint warning, written as 50% in XML
+  "sd_pair"         a slur/doubling pair in the empty slots 8 and 9: vertical lines (slot 8) then horizontal
+                    lines (slot 9), K 100%, 0.125 mm lines every 0.25 mm, drawn as strokes
+  "sd_pair_spot"    the same pair in the first spot ink
+  "few_lines"       only four vertical lines in slot 8 -> too few to be a line patch
   "ladder"          the last slot is a white patch with four stacked tint bars (K 2, 3, 4, 5%) over it,
                     like the tint ladder in the TCS C4 template -> one slot, never a separate bar
   "second_spot"     the C100 patch in slot 2 is drawn in a second spot ink, which therefore appears
@@ -165,8 +169,31 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
             if "label_wrong" in markers:
                 label(1, "75%")
 
+        def cell_rect(k):                          # slot k as (left, bottom, width, height) in mm
+            if orientation == "horizontal":
+                return x0 + k * PATCH_ALONG, y0, PATCH_ALONG, PATCH_ACROSS
+            top = page_h - 14.0
+            return 8.0, top - (k + 1) * PATCH_ALONG, PATCH_ACROSS, PATCH_ALONG
+
+        def lines_patch(k, direction, spot=False, count=None, pitch=0.25, width=0.125):
+            cx0, cy0, w, h = cell_rect(k)
+            c.append(("/CSspot CS 1 SCN" if spot else "0 0 0 1 K") + " %s w" % _n(width * MM))
+            span = w if direction == "vertical" else h
+            n = count or int((span - 0.2) / pitch) + 1
+            for i in range(n):
+                off = 0.1 + i * pitch
+                if direction == "vertical":
+                    c.append("%s %s m %s %s l S" % (_n((cx0 + off) * MM), _n(cy0 * MM), _n((cx0 + off) * MM), _n((cy0 + h) * MM)))
+                else:
+                    c.append("%s %s m %s %s l S" % (_n(cx0 * MM), _n((cy0 + off) * MM), _n((cx0 + w) * MM), _n((cy0 + off) * MM)))
+
         for mk in markers:
-            if mk == "ladder":
+            if mk in ("sd_pair", "sd_pair_spot"):
+                lines_patch(8, "vertical", spot=mk == "sd_pair_spot")
+                lines_patch(9, "horizontal", spot=mk == "sd_pair_spot")
+            elif mk == "few_lines":
+                lines_patch(8, "vertical", count=4)
+            elif mk == "ladder":
                 lx = x0 + (len(slots) - 1) * PATCH_ALONG
                 for j, tint in enumerate((0.02, 0.03, 0.04, 0.05)):
                     cmyk(0, 0, 0, tint)

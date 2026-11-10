@@ -99,3 +99,25 @@ def test_a_label_that_contradicts_its_patch_can_be_followed_or_not(base_url, tmp
             page.click("#dlXml")
         assert 'rRef="P_TC"' not in open(d2.value.path(), encoding="utf-8").read()
         browser.close()
+
+
+def test_sd_patches_are_listed_and_written_as_slur_patches(base_url, tmp_path):
+    import sys
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    from make_sample import build_pdf
+    pdf = tmp_path / "sd.pdf"
+    pdf.write_bytes(build_pdf("horizontal", markers=("sd_pair",)))
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(base_url)
+        page.wait_for_selector("#engine.ready", timeout=240_000)
+        page.set_input_files("#file", str(pdf))
+        page.wait_for_selector("#out.on", timeout=120_000)
+        assert "S/D patches" in page.inner_text("#summary")
+        assert "S/D vertical lines K100" in page.inner_text("#tbl")
+        with page.expect_download() as d:
+            page.click("#dlXml")
+        xml = open(d.value.path(), encoding="utf-8").read()
+        assert 'Type="Slur"' in xml and "P_0\u00b0K" in xml and "P_90\u00b0K" in xml
+        browser.close()

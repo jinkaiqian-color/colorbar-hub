@@ -42,7 +42,7 @@ from collections import Counter
 from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 PT2MM = 25.4 / 72.0
 MM2PT = 72.0 / 25.4
@@ -307,14 +307,17 @@ def hexrgb(rgb):
 
 
 class GState:
-    __slots__ = ("ctm", "fill")
+    __slots__ = ("ctm", "fill", "stroke", "lw")
 
-    def __init__(self, ctm=IDENTITY, fill=None):
+    def __init__(self, ctm=IDENTITY, fill=None, stroke=None, lw=1.0):
         self.ctm = ctm
         self.fill = fill or Fill(DEVICE_CS["DeviceGray"], [0.0])
+        self.stroke = stroke or Fill(DEVICE_CS["DeviceGray"], [0.0])
+        self.lw = lw
 
     def copy(self):
-        return GState(self.ctm, Fill(self.fill.cs, list(self.fill.vals)))
+        return GState(self.ctm, Fill(self.fill.cs, list(self.fill.vals)),
+                      Fill(self.stroke.cs, list(self.stroke.vals)), self.lw)
 
 
 PAINT_FILL = {"f", "F", "f*", "B", "B*", "b", "b*"}
@@ -357,6 +360,7 @@ class Collector:
         self.rects = []  # dicts with x0,y0,x1,y1 (pt, user space) and fill
         self.shapes = []  # everything else that marks the page: curves, outlines, text, images
         self.texts = []   # the strings written on the page, each with the centre of where it is drawn
+        self.lines = []   # straight, axis-aligned stroked lines: end points, width and ink
         self.stats = Counter()
         self._cs_cache = {}
 
@@ -414,6 +418,30 @@ class Collector:
             elif op == "cs":
                 cs = self._lookup_cs(operands[0], resources)
                 gs.fill = Fill(cs, initial_values(cs))
+            # stroke colour and line width (needed to read lines drawn as strokes)
+            elif op == "w":
+                try:
+                    gs.lw = float(operands[0])
+                except Exception:
+                    pass
+            elif op == "G":
+                gs.stroke = Fill(DEVICE_CS["DeviceGray"], [float(operands[0])])
+            elif op == "RG":
+                gs.stroke = Fill(DEVICE_CS["DeviceRGB"], [float(x) for x in operands[:3]])
+            elif op == "K":
+                gs.stroke = Fill(DEVICE_CS["DeviceCMYK"], [float(x) for x in operands[:4]])
+            elif op == "CS":
+                cs = self._lookup_cs(operands[0], resources)
+                gs.stroke = Fill(cs, initial_values(cs))
+            elif op in ("SC", "SCN"):
+                vals = []
+                for x in operands:
+                    try:
+                        vals.append(float(x))
+                    except Exception:
+                        pass
+                if vals:
+                    gs.stroke = Fill(gs.stroke.cs, vals)
             elif op in ("sc", "scn"):
                 vals = []
                 for x in operands:
@@ -537,8 +565,15 @@ class Collector:
             self.shapes.append({"kind": kind, "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys)})
 
     def _outline(self, subpaths, gs):
+        scale = math.hypot(gs.ctm[0], gs.ctm[1])
         for sp in subpaths:
-            self._add_shape("curve" if sp["curved"] else "outline", [mapply(gs.ctm, x, y) for x, y in sp["pts"]])
+            tp = [mapply(gs.ctm, x, y) for x, y in sp["pts"]]
+            self._add_shape("curve" if sp["curved"] else "outline", tp)
+            if not sp["curved"] and len(tp) == 2:           # one straight segment: maybe a line of a line patch
+                (xa, ya), (xb, yb) = tp
+                if abs(xa - xb) < 0.02 or abs(ya - yb) < 0.02:
+                    self.lines.append({"xa": xa, "ya": ya, "xb": xb, "yb": yb, "w": gs.lw * scale,
+                                       "stroke": Fill(gs.stroke.cs, list(gs.stroke.vals))})
 
     def _image(self, gs):
         self._add_shape("image", [mapply(gs.ctm, x, y) for x, y in ((0, 0), (1, 0), (1, 1), (0, 1))])
@@ -773,7 +808,7 @@ def _spot_slots(names):
     return {n: 5 + i for i, n in enumerate(names)}
 
 
-def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=()):
+def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=(), lines=()):
     axis = ev["axis"]
     members = ev["members"]
     mem_ids = {id(r) for r in members}
@@ -919,6 +954,50 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
             kept.append(e)
         extras[k] = kept
 
+    # ---- line patches (slur and doubling): a cell filled with parallel straight lines -------------
+    # Lines are strokes, so they have no width in an outline and the hairline rule above ignores them.
+    # A cell with at least 5 equal, evenly spaced lines in one ink is a patch of its own.
+    line_patch = {}
+    per_cell = {}
+    for ln in lines:
+        if ln["w"] < 0.05 * MM2PT:
+            continue                                   # a hairline: a tick or a rule, not part of a pattern
+        bb = {"x0": min(ln["xa"], ln["xb"]), "x1": max(ln["xa"], ln["xb"]),
+              "y0": min(ln["ya"], ln["yb"]), "y1": max(ln["ya"], ln["yb"])}
+        a0, a1, c0, c1 = frame(bb)
+        cc = (c0 + c1) / 2
+        if cc < -tol_cross or cc > cross_len_pt + tol_cross:
+            continue
+        k = int(math.floor(((a0 + a1) / 2 - phase) / pitch))
+        if not (0 <= k < slot_count):
+            continue
+        across = (c1 - c0) > (a1 - a0)                 # the line runs across the bar, not along it
+        phys = "vertical" if abs(ln["xa"] - ln["xb"]) < 0.02 else "horizontal"
+        ink_sig = tuple(sorted((key, round(t, 3)) for key, t in decode_fill(ln["stroke"])[0]))
+        per_cell.setdefault(k, {}).setdefault((phys, across, round(ln["w"] * PT2MM, 2), ink_sig), []).append(
+            ((a0 + a1) / 2 if across else cc, ln))
+    for k, groups_ in per_cell.items():
+        good = []
+        for (phys, across, _w, ink_sig), items in groups_.items():
+            if len(items) < 5 or not ink_sig:
+                continue
+            pos = sorted(x[0] for x in items)
+            steps = [b2 - a2 for a2, b2 in zip(pos, pos[1:])]
+            step = statistics.median(steps)
+            width_pt = statistics.median(x[1]["w"] for x in items)
+            span = (plen if across else pthick)        # the cell's size in the direction the lines are spread
+            if step <= 1.05 * width_pt or any(abs(d - step) > 0.25 * step for d in steps):
+                continue                               # not evenly spaced, or the lines would overlap into a solid
+            if len(items) * step < 0.6 * span:
+                continue                               # fills only a corner of the cell
+            good.append((len(items), phys, across, pos, step, width_pt, items[0][1]["stroke"]))
+        if len(good) == 1:                             # two directions in one cell would be a cross-hatch: left alone
+            n_, phys, across, pos, step, width_pt, stroke = good[0]
+            first = (pos[0] - (phase + k * pitch)) if across else pos[0]
+            line_patch[k] = {"direction": phys, "count": n_, "width_mm": round(width_pt * PT2MM, 3),
+                             "pitch_mm": round(step * PT2MM, 3), "frame_dir": "across" if across else "along",
+                             "first_mm": round(first * PT2MM, 3), "fill": stroke}
+
     # ---- spot colors are numbered by first appearance along the reading direction -------------
     spot_names = []
 
@@ -931,6 +1010,9 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
         ex = extras.get(k, [])
         if any(not e["part"] for e in ex):
             continue                                  # an NU cell carries no ink
+        if k in line_patch:
+            note_spots(line_patch[k]["fill"])
+            continue
         parts = sorted((e for e in ex if e["part"]), key=lambda e: (e["c0"], e["a0"]))
         if parts:
             for e in parts:
@@ -962,13 +1044,19 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
         rec = {"slot": k + 1, "along_mm": round(k * pitch * PT2MM, 3), "cross_mm": round(c_start * PT2MM, 3),
                "len_mm": round(plen * PT2MM, 3), "thick_mm": round(c_thick * PT2MM, 3),
                "parts": [], "detail": "", "empty": m is None and not ex,
-               "paper": False, "coating": False, "inks": []}
+               "paper": False, "coating": False, "inks": [], "lines": None}
         if marks_here:
             kinds = Counter(e["kind"] for e in marks_here)
             words = {"rect": ("box", "boxes"), "outline": ("outline", "outlines"), "curve": ("curve", "curves"),
                      "shape": ("shape", "shapes"), "text": ("text run", "text runs"), "image": ("image", "images")}
             rec.update(kind="nu", label="NU", rgb=hexrgb(NU_RGB),
                        detail=", ".join(f"{n} {words[kd][0 if n == 1 else 1]}" for kd, n in kinds.most_common()))
+        elif k in line_patch:
+            lp_ = line_patch[k]
+            lab, ink_out, _p, coat, rgb = _describe_fill(lp_["fill"], spot_label, spot_names)
+            rec.update(kind="lines", label=f"S/D {lp_['direction']} lines {lab}", inks=ink_out, coating=coat, rgb=rgb,
+                       empty=False, lines={x: lp_[x] for x in ("direction", "count", "width_mm", "pitch_mm", "frame_dir", "first_mm")},
+                       detail=f"{lp_['count']} lines, {lp_['width_mm']:g} mm wide, {lp_['pitch_mm']:g} mm apart")
         elif len(parts) >= 2:
             labs, outs = [], []
             for e in parts:
@@ -1100,12 +1188,13 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
         "reference": "corner mark" if mark else "default order",
         "start_mm": {"x": round(start_pt[0] * PT2MM, 2), "y": round(start_pt[1] * PT2MM, 2)},
         "corner_mark": corner,
-        "patch_w_mm": round(pw * PT2MM, 3),
-        "patch_h_mm": round(ph * PT2MM, 3),
+        "patch_w_mm": round(pw * PT2MM, 4),
+        "patch_h_mm": round(ph * PT2MM, 4),
         "pitch_mm": round(pitch * PT2MM, 3),
         "patch_count": slot_count,
         "slot_count": slot_count,
-        "counts": {"ink": counts["ink"] + counts["split"], "paper": counts["paper"], "nu": counts["nu"]},
+        "counts": {"ink": counts["ink"] + counts["split"], "paper": counts["paper"], "nu": counts["nu"],
+                   "sd": counts["lines"]},
         "empty_slots": [p["slot"] for p in patches if p["empty"]],
         "length_mm": round(slot_count * pitch * PT2MM, 3),
         "origin_mm": {"x": round(bx0 * PT2MM, 2), "y": round(top0 * PT2MM, 2)},
@@ -1180,7 +1269,7 @@ def _inside(inner, outer, tol=0.5):
             and inner[2] <= outer[2] + tol and inner[3] <= outer[3] + tol)
 
 
-def build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts=()):
+def build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts=(), lines=()):
     """Turn one detected line into candidates, folding step-and-repeat copies into a single core.
 
     Returns a list of candidates (normally one). A folded candidate has "repeat" set and describes
@@ -1193,7 +1282,7 @@ def build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts=()):
     def sub_ev(members):
         return dict(ev, members=members, conform=1.0, score=len(members) + 2 * len({m["sig"] for m in members}))
 
-    built = [build_candidate(sub_ev(sg), rects, shapes, page_w, page_h, 0, marks, texts) for sg in segs]
+    built = [build_candidate(sub_ev(sg), rects, shapes, page_w, page_h, 0, marks, texts, lines) for sg in segs]
     seg_start = [(sg[0]["x0"] if horizontal else page_h - sg[0]["y1"]) for sg in segs]
 
     # --- copies on separate grids: all segments must carry the same design --------------------
@@ -1229,7 +1318,7 @@ def build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts=()):
         keep = [m for m in core_members if slot_of.get(id(m), 10 ** 9) < period]
         if len(keep) >= MIN_CORE_SLOTS:
             full = core
-            core = build_candidate(sub_ev(keep), rects, shapes, page_w, page_h, 0, marks, texts)
+            core = build_candidate(sub_ev(keep), rects, shapes, page_w, page_h, 0, marks, texts, lines)
             core_slots = core["slot_count"]
             copies_grid = -(-n // period)                           # ceil(n / period)
             partial_last = (n - (copies_grid - 1) * period) < core_slots
@@ -1328,6 +1417,7 @@ def analyze(source, name=None):
         sh["y1"] -= lly
         shapes.append(sh)
     texts = [dict(t, cx=t["cx"] - llx, cy=t["cy"] - lly) for t in col.texts]
+    lines = [dict(l, xa=l["xa"] - llx, xb=l["xb"] - llx, ya=l["ya"] - lly, yb=l["yb"] - lly) for l in col.lines]
     marks = find_corner_marks(rects)
     found = find_bars(rects, page_w, page_h)
     if not found:
@@ -1342,7 +1432,7 @@ def analyze(source, name=None):
         if any(_inside(box, cv) for cv in covered):
             continue                                   # a part of a bar, such as a tint ladder stacked in one cell
         used.append(ids)
-        built = build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts)
+        built = build_line_candidates(ev, rects, shapes, page_w, page_h, marks, texts, lines)
         if built:
             covered.append(box)
             pending.extend(built)
@@ -1414,6 +1504,11 @@ def _num(v):
     return f"{v:.3f}".rstrip("0").rstrip(".") or "0"
 
 
+def _dim(v):
+    """A patch dimension in mm to the nearest 0.0005: 4.0623 is 4.0625, 3.0 is 3, 9.525 stays 9.525."""
+    return f"{round(v / 0.0005) * 0.0005:.4f}".rstrip("0").rstrip(".") or "0"
+
+
 def _xml_patch(p, slot_of, notes, use_labels=True):
     """The template ID and definition for one slot record."""
     kind = p["kind"]
@@ -1426,6 +1521,10 @@ def _xml_patch(p, slot_of, notes, use_labels=True):
         return "P_P", {"type": "Paper", "ptd": {"Slot": "0"}}
     inks = sorted(p["inks"], key=lambda i: slot_of[i["ink"]])
     sym = lambda i: i["ink"] if i["ink"] in PROCESS_SLOT else str(slot_of[i["ink"]] - 4)
+    if kind == "lines":
+        vertical = p["lines"]["direction"] == "vertical"
+        return f"P_{'0' if vertical else '90'}\u00b0{sym(inks[0])}", {
+            "type": "Slur", "ptd": {"Slot": str(slot_of[inks[0]["ink"]]), "Type": "Vertical" if vertical else "Horizontal"}}
     if len(inks) == 1:
         i = inks[0]
         t, s_, slot = i["tint"], sym(i), slot_of[i["ink"]]
@@ -1503,7 +1602,7 @@ def build_xml(result, cand, use_labels=True):
 
     stem = os.path.splitext(os.path.basename(str(result.get("file", "") or "ColorBar")))[0]
     root = ET.Element("ColorBar", {"Name": stem.replace("_", " ")})
-    ET.SubElement(root, "TemplatePatch", {"Width": _num(cand["patch_w_mm"]), "Height": _num(cand["patch_h_mm"]),
+    ET.SubElement(root, "TemplatePatch", {"Width": _dim(cand["patch_w_mm"]), "Height": _dim(cand["patch_h_mm"]),
                                           "Type": "DefaultPatch"})
     ref = ET.SubElement(root, "ReferencePatches")
     for pid, d in defs.items():
