@@ -83,6 +83,8 @@ How a slot becomes a patch ID:
 | inks together at 100% | `Overprint`, ID `P_CM`, `P_CY`, `P_MY`, `P_CMY`, with an `InkList` |
 | C/M/Y at 50/40/40, 25/19/19, 75/66/66 | `Balance` (`P_HR_CMY`, `P_HC_CMY`, `P_SC_CMY`) with its `GrayBalanceType` |
 | no ink | `Paper`, ID `P_P` |
+| S/D line patch, vertical lines | `Slur`, ID `P_0°K`, `P_0°C`, `P_0°M`, `P_0°Y`(spot inks `P_0°1`,...), with the ink `Slot` and `Type="Vertical"`|
+| S/D line patch, horizontal lines | `Slur`, ID `P_90°K`, ..., with the ink `Slot` and `Type="Horizontal"`|
 | NU | `NotUsed`, ID `P_NU` |
 
 `Slot` inside a definition is the **ink slot**, not the position of the patch on the bar: Paper 0, K 1, C 2, M 3,
@@ -100,8 +102,25 @@ and printed to stderr by the command line:
   as its own generic definition
 - a cell split into parts is written as NU
 
-The `RasterSettings` block is the same fixed block as in the templates. The layout is produced by `build_xml()` in
+Where a printed label disagrees with a patch, the label's tint is written unless the option to follow the labels is switched off 
+(see Printed labels against the patches). The `RasterSettings` block is the same fixed block as in the templates. The layout is produced by `build_xml()` in
 `colorbar_core.py`.
+
+## S/D (slur and doubling) patches
+ 
+A slur/doubling patch is a cell filled with fine parallel lines, vertical in one patch and horizontal in the next. The
+lines are drawn as strokes, so they have no width in the outline of the page, and an earlier version read these cells as
+paper white. A cell is now recognized as a **line patch** when it holds:
+ 
+- at least **5 parallel straight lines**, all vertical or all horizontal, of the same width (at least 0.05 mm)
+- in **one ink**, evenly spaced, and not overlapping into a solid
+- spread over most of the cell
+The patch map lists it as, for example, *S/D vertical lines K100 · 17 lines, 0.125 mm wide, 0.247 mm apart*, the summary
+counts the S/D patches, and the preview draws the real lines. In the XML a vertical-line patch is `P_0°K` (angle 0°) and a
+horizontal-line patch is `P_90°K`, as in the colorbar templates. The direction is the physical direction on the sheet, so
+it does not change when a corner mark makes the bar read from the other end. Single thin lines (the tick marks between
+groups) and fewer than 5 lines are not patches. Lines drawn as thin filled rectangles instead of strokes are not
+recognized, and show as NU.
 
 ## Slot types
 
@@ -129,6 +148,55 @@ parts in order, for example `K2 / K3 / K4 / K5`.
 
 Patch positions come from a straight-line fit of position against slot number, so offsets sit on the grid.
 A patch that is more than 0.05 mm off the grid is listed in a warning, and the offsets still use the grid position.
+
+## Printed labels against the patches
+ 
+Bars often print a percentage under each tint patch (`75%`, `50%`, `25%`). The tool reads those labels, matches each
+to the patch it sits under, and compares the printed value with the tint the patch is drawn in. When they disagree
+the file contradicts itself, and the page shows a warning such as *"The printed label says 75% but the patch is
+C 100% at slots 13 and 45."* The slot's row in the patch map reads *label says 75%*.
+ 
+In the XML the tool **follows the printed label** by default, so a patch labelled 75% and drawn at 100% is written as
+75% (`P_TC`), with a note. Untick **Follow the printed labels** to keep every patch as drawn instead (`--as-drawn` on
+the command line). The option only appears when there is a disagreement.
+ 
+The check applies only to:
+ 
+- labels that are plain text in the PDF and read exactly as a percentage (`75%`), within 8 mm of the bar
+- patches made of a single ink. A label over a gray-balance or overprint patch is not compared.
+- labels that are the standard tints 25, 50, 75 or 100% when the XML follows the label
+Labels that were converted to outlines, or that use an unusual font encoding, cannot be read and are skipped
+without any warning. The standard-tint warning (a 60% patch among 25, 50 and 75%) still catches odd values then.
+ 
+## Step and repeat
+ 
+A production file often carries the colorbar design several times, stepped and repeated until the bar fills the
+sheet (a 40 inch sheet, for example), while the template holds the core design once. When that happens the page
+**shows and exports one core only** and flags the repeats: how many copies, the length of the whole run, and the
+distance between copies.
+ 
+A repeat is found when:
+ 
+- the same design appears at least **2 whole times**, and every slot of every copy matches (ink, tint, paper or NU)
+- the core has at least **4 slots**
+- the last copy may be cut short, because a bar ends at its last patch
+The copies can sit in any of three ways, and all three are handled:
+ 
+| Copies are | Example |
+|---|---|
+| on one grid, touching | the step is a whole number of patches, such as 64 patches of 4.0625 mm |
+| on one grid, with empty slots between them | the gap is a whole number of patch widths |
+| each on its own grid | the step is any other distance, such as the template's page width |
+ 
+Identical bars on separate lines (the same bar repeated across the sheet) are folded into one as well. Copies placed
+as a reusable form XObject, the usual way a step and repeat is made, are found like copies drawn directly.
+ 
+The core is the first copy in reading order, or the copy next to a corner mark when there is one. Its position, size and
+preview crop are those of the core alone, and the XML is exactly the XML of the core design. A bar that is only
+nearly periodic, with one slot different in a later copy, is not folded and shows as one long bar.
+ 
+A tint ladder stacked in one cell (like the 2 to 5% bars in the TCS C4 template) is part of that cell and is never
+reported as a bar of its own.
 
 ## Corner marks and the first patch
 
