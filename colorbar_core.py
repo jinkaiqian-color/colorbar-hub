@@ -10,6 +10,7 @@ analyze(source, name=None)         -> dict   source: file path, bytes, or binary
 analyze_for_web(source, name=None) -> dict   same, plus an XML string for each candidate bar
                                              (name overrides the file name shown in the result)
 candidate_xml(result, candidate) -> str   the bar in the colorbar template XML format
+build_stp(candidate, title)      -> (text, notes)   the bar as a Techkon STP strip file
 
 How the bar is found
 --------------------
@@ -42,7 +43,7 @@ from collections import Counter
 from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 PT2MM = 25.4 / 72.0
 MM2PT = 72.0 / 25.4
@@ -1626,10 +1627,103 @@ def candidate_xml(result, cand, use_labels=True):
     return build_xml(result, cand, use_labels)[0]
 
 
+# --------------------------------------------------------------------------
+# Techkon STP export
+# --------------------------------------------------------------------------
+# <title>
+# Number Patches,<n>
+# Number Colors,<4 + spot inks>
+# Default Width,<mm, 5 decimals>
+# Inkzone Width,<mm, 5 decimals>
+# START_STRIP
+# <index>,<TAB><width>,<TAB><TYPE>,<TAB><C>,<TAB><M>,<TAB><Y>,<TAB><K>[,<TAB><spot 1>,...]
+# END_STRIP
+# CRLF line ends, ASCII, and no line end after END_STRIP, as in the example files.
+#
+# Types: SD solid, DP tint, GB gray balance (any C+M+Y patch), CM / CY / MY two-ink overprints,
+# SD0 / SD90 slur and doubling lines (vertical / horizontal), CAL paper white, NO not used.
+
+STP_INKZONE_MM = 32.5
+
+
+def _stp_row(p, cols, notes, follow, use_labels):
+    """The STP type code and ink vector for one slot record."""
+    zero = [0] * len(cols)
+    kind = p["kind"]
+    if kind == "nu":
+        return "NO", zero
+    if kind == "split":
+        notes.append(f"Patch {p['slot']} is split into several parts across the cell, so it is written as NO (not used).")
+        return "NO", zero
+    if kind == "paper":
+        return "CAL", zero
+    idx = {name: i for i, name in enumerate(cols)}
+
+    def vec(inks):
+        v = list(zero)
+        for i in inks:
+            v[idx[i["ink"]]] = i["tint"]
+        return v
+
+    inks = p["inks"]
+    if not inks:
+        notes.append(f"Patch {p['slot']} ({p['label']}) has no ink values, so it is written as NO (not used).")
+        return "NO", zero
+    if kind == "lines":
+        return ("SD0" if p["lines"]["direction"] == "vertical" else "SD90"), vec(inks)
+    if len(inks) == 1:
+        i = inks[0]
+        t = i["tint"]
+        lp = p.get("label_pct")
+        if use_labels and lp is not None and lp in (25, 50, 75, 100) and lp != t:
+            follow.setdefault((lp, i["ink"], t), []).append(p["slot"])
+            t = lp
+        return ("SD" if t == 100 else "DP"), vec([{"ink": i["ink"], "tint": t}])
+    names = [i["ink"] for i in inks]
+    if sorted(names) == ["C", "M", "Y"]:
+        return "GB", vec(inks)
+    if len(inks) == 2 and all(n in ("C", "M", "Y") for n in names) and all(i["tint"] == 100 for i in inks):
+        return "".join(sorted(names, key="CMY".index)), vec(inks)
+    notes.append(f"Patch {p['slot']} ({p['label']}) is not a patch type the STP examples show, so it is written as NO (not used).")
+    return "NO", zero
+
+
+def build_stp(cand, title, inkzone_mm=STP_INKZONE_MM, use_labels=True):
+    """-> (STP text, notes). Notes list anything that was adjusted or could not be matched exactly."""
+    notes, follow = [], {}
+    cols = ["C", "M", "Y", "K"] + [sp["label"] for sp in sorted(cand["spots"], key=lambda x: x["ink_slot"])]
+    patches = cand["patches"]
+    along = cand["patch_w_mm"] if cand.get("orientation") != "vertical" else cand["patch_h_mm"]   # the size along the strip
+    default_width = float(_dim(along))
+    body = []
+    for p in patches:
+        code, vector = _stp_row(p, cols, notes, follow, use_labels)
+        body.append(f"{p['slot']},\t{round(p['len_mm'], 2):.5f},\t{code},\t" + ",\t".join(str(v) for v in vector))
+    for (want, ink, have), sl in follow.items():
+        many = len(sl) > 1
+        names = [str(x) for x in sl]
+        where = " and ".join(names) if len(names) <= 2 else ", ".join(names[:-1]) + " and " + names[-1]
+        notes.append(f"Patch{'es' if many else ''} {where}: the printed label says {want}% but the patch is {ink} {have}%, "
+                     f"so {'they are' if many else 'it is'} written as {want}%, following the label.")
+    if cand.get("orientation") == "vertical":
+        notes.append("The bar is vertical on the sheet, so the patch width in the STP is the size along the bar.")
+    title = re.sub(r"\s+", " ", str(title or "")).strip() or "TECHKON"
+    head = [title, f"Number Patches,{len(patches)}", f"Number Colors,{len(cols)}",
+            f"Default Width,{default_width:.5f}", f"Inkzone Width,{float(inkzone_mm):.5f}", "START_STRIP"]
+    return "\r\n".join(head + body + ["END_STRIP"]), notes
+
+
+def default_stp_title(file_name):
+    stem = os.path.splitext(os.path.basename(str(file_name or "") or "ColorBar"))[0]
+    return "TECHKON " + re.sub(r"\s+", " ", stem.replace("_", " ")).strip()
+
+
 def analyze_for_web(source, name=None):
     """analyze() plus a ready-to-download XML string on every candidate."""
     res = analyze(source, name)
     res["engine_version"] = __version__
+    res["stp_title"] = default_stp_title(res.get("file"))
+    res["stp_inkzone_mm"] = STP_INKZONE_MM
     for c in res["candidates"]:
         c["xml"], c["xml_notes"] = build_xml(res, c)
         if c["label_mismatches"]:                       # offer the other reading as well

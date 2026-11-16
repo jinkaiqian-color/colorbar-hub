@@ -653,3 +653,129 @@ def test_patch_dimensions_in_the_xml_are_rounded_to_the_nearest_half_micrometre(
     assert core._dim(4.0623) == "4.0625" and core._dim(4.0627) == "4.0625" and core._dim(4.06) == "4.06"
     assert core._dim(3.0) == "3" and core._dim(2.9999) == "3" and core._dim(5.0001) == "5"
     assert core._dim(9.525) == "9.525" and core._dim(6.0001) == "6"
+
+
+# ---- Techkon STP export ---------------------------------------------------------------------------------
+
+def stp_of(title="TECHKON SAMPLE", **kw):
+    use_labels = kw.pop("use_labels", True)
+    inkzone = kw.pop("inkzone", 32.5)
+    c = one(**kw)
+    return core.build_stp(c, title, inkzone, use_labels)
+
+
+def rows_of(text):
+    return [l for l in text.split("\r\n") if l[:1].isdigit()]
+
+
+def test_stp_has_the_layout_of_the_example_files():
+    import re
+    text, notes = stp_of(orientation="horizontal")
+    lines = text.split("\r\n")
+    assert lines[:6] == ["TECHKON SAMPLE", "Number Patches,18", "Number Colors,5", "Default Width,4.00000",
+                         "Inkzone Width,32.50000", "START_STRIP"]
+    assert lines[-1] == "END_STRIP" and not text.endswith("\n") and "\n" not in text.replace("\r\n", "")
+    assert text.isascii() and len(rows_of(text)) == 18
+    for i, row in enumerate(rows_of(text), start=1):
+        assert re.fullmatch(r"%d,\t\d+\.\d{5},\t[A-Z0-9]+(,\t\d+){5}" % i, row), row     # index, width, type, C M Y K S1
+    assert notes == []
+
+
+def test_stp_types_and_ink_vectors():
+    text, _ = stp_of(orientation="horizontal")
+    rows = [r.split(",\t") for r in rows_of(text)]
+    t = lambda i: (rows[i - 1][2], [int(x) for x in rows[i - 1][3:]])
+    assert t(1) == ("SD", [0, 0, 0, 100, 0]) and t(2) == ("SD", [100, 0, 0, 0, 0])      # solid K and C
+    assert t(3) == ("SD", [0, 100, 0, 0, 0]) and t(4) == ("SD", [0, 0, 100, 0, 0])
+    assert t(5) == ("SD", [0, 0, 0, 0, 100])                                              # the spot ink after C M Y K
+    assert t(6) == ("GB", [50, 40, 40, 0, 0])                                             # gray balance
+    assert t(7) == ("DP", [0, 0, 0, 50, 0])                                               # a tint
+    assert t(8) == ("CAL", [0, 0, 0, 0, 0]) and t(9)[0] == "CAL"                          # paper white, drawn or not
+    assert t(16) == ("DP", [0, 0, 0, 0, 25]) and t(17) == ("DP", [0, 0, 0, 0, 50]) and t(18) == ("DP", [0, 0, 0, 0, 75])
+
+
+def test_stp_writes_nu_and_sd_patches_with_their_codes():
+    text, _ = stp_of(orientation="horizontal", markers=("circle_gap",))
+    assert [r.split(",\t")[2] for r in rows_of(text)][8] == "NO"
+    text, _ = stp_of(orientation="horizontal", markers=("sd_pair",))
+    rows = [r.split(",\t") for r in rows_of(text)]
+    assert rows[8][2:] == ["SD0", "0", "0", "0", "100", "0"] and rows[9][2:] == ["SD90", "0", "0", "0", "100", "0"]
+    text, _ = stp_of(orientation="horizontal", markers=("sd_pair_spot",))
+    rows = [r.split(",\t") for r in rows_of(text)]
+    assert rows[8][2:] == ["SD0", "0", "0", "0", "0", "100"] and rows[9][2:] == ["SD90", "0", "0", "0", "0", "100"]
+
+
+def test_stp_follows_the_reading_order_of_the_bar():
+    forward, _ = stp_of(orientation="horizontal")
+    reversed_, _ = stp_of(orientation="horizontal", corner_mark="end")
+    f = [r.split(",\t")[2:] for r in rows_of(forward)]
+    r = [x.split(",\t")[2:] for x in rows_of(reversed_)]
+    assert r == f[::-1]
+    assert [int(x.split(",")[0]) for x in rows_of(reversed_)] == list(range(1, 19))
+
+
+def fake_patch(slot, kind, inks=(), **extra):
+    p = {"slot": slot, "kind": kind, "label": " ".join(f"{n}{t}" for n, t in inks) or kind, "len_mm": 4.0625,
+         "inks": [{"ink": n, "tint": t} for n, t in inks], "parts": [], "detail": "", "lines": None}
+    p.update(extra)
+    return p
+
+
+def test_stp_overprints_gray_balance_and_what_it_cannot_express():
+    patches = [fake_patch(1, "ink", [("C", 100), ("M", 100)]), fake_patch(2, "ink", [("C", 100), ("Y", 100)]),
+               fake_patch(3, "ink", [("M", 100), ("Y", 100)]), fake_patch(4, "ink", [("C", 100), ("M", 100), ("Y", 100)]),
+               fake_patch(5, "ink", [("C", 25), ("M", 19), ("Y", 19)]), fake_patch(6, "ink", [("C", 50), ("K", 50)]),
+               fake_patch(7, "split", []), fake_patch(8, "ink", [("K", 100), ("C", 100)])]
+    cand = {"patches": patches, "spots": [], "patch_w_mm": 4.0625, "patch_h_mm": 6.0, "orientation": "horizontal"}
+    text, notes = core.build_stp(cand, "T")
+    rows = [r.split(",\t") for r in rows_of(text)]
+    assert [r[2] for r in rows] == ["CM", "CY", "MY", "GB", "GB", "NO", "NO", "NO"]
+    assert rows[3][3:] == ["100", "100", "100", "0"] and rows[4][3:] == ["25", "19", "19", "0"]
+    assert len(notes) == 3 and any("split into several parts" in n for n in notes)
+    assert sum("not a patch type the STP examples show" in n for n in notes) == 2
+
+
+def test_stp_spot_columns_follow_the_ink_slots():
+    cand = {"patches": [fake_patch(1, "ink", [("S2", 100)]), fake_patch(2, "ink", [("S1", 50)])],
+            "spots": [{"label": "S1", "ink_slot": 5}, {"label": "S2", "ink_slot": 6}],
+            "patch_w_mm": 4.0, "patch_h_mm": 6.0, "orientation": "horizontal"}
+    text, _ = core.build_stp(cand, "T")
+    assert "Number Colors,6" in text
+    assert rows_of(text)[0].endswith("SD,\t0,\t0,\t0,\t0,\t0,\t100") and rows_of(text)[1].endswith("DP,\t0,\t0,\t0,\t0,\t50,\t0")
+
+
+def test_stp_follows_a_contradicting_label_like_the_xml_does():
+    text, notes = stp_of(orientation="horizontal", markers=("label_wrong",))
+    assert rows_of(text)[1].split(",\t")[2:] == ["DP", "75", "0", "0", "0", "0"]
+    assert any("Patch 2: the printed label says 75% but the patch is C 100%" in n for n in notes)
+    text, notes = stp_of(orientation="horizontal", markers=("label_wrong",), use_labels=False)
+    assert rows_of(text)[1].split(",\t")[2:] == ["SD", "100", "0", "0", "0", "0"] and notes == []
+
+
+def test_stp_title_inkzone_and_width_formatting():
+    text, _ = stp_of(title="  TECHKON   my\tstrip \r\n", orientation="horizontal", inkzone=40)
+    assert text.split("\r\n")[0] == "TECHKON my strip" and "Inkzone Width,40.00000" in text
+    assert core.build_stp({"patches": [], "spots": [], "patch_w_mm": 4.0, "patch_h_mm": 6.0, "orientation": "horizontal"}, "")[0].startswith("TECHKON\r\n")
+    cand = {"patches": [fake_patch(1, "ink", [("K", 100)], len_mm=4.063)], "spots": [], "patch_w_mm": 4.0625,
+            "patch_h_mm": 6.0, "orientation": "horizontal"}
+    text, _ = core.build_stp(cand, "T")
+    assert "Default Width,4.06250" in text and rows_of(text)[0].split(",\t")[1] == "4.06000"       # as in the example files
+
+
+def test_stp_on_a_vertical_bar_uses_the_size_along_the_bar():
+    text, notes = stp_of(orientation="vertical")
+    assert "Default Width,4.00000" in text and rows_of(text)[0].split(",\t")[1] == "4.00000"      # 4 mm along, 6 mm across
+    assert any("vertical on the sheet" in n for n in notes)
+
+
+def test_stp_of_a_repeated_bar_is_the_stp_of_its_core():
+    single, _ = stp_of(orientation="horizontal", markers=("sd_pair",))
+    for kw in ({"repeat": (3, 72.0)}, {"repeat": (3, 75.5)}, {"repeat": (3, 75.5), "as_form": True}):
+        assert stp_of(orientation="horizontal", markers=("sd_pair",), **kw)[0] == single, kw
+
+
+def test_the_default_stp_title_comes_from_the_file_name():
+    assert core.default_stp_title("TCS_USA_325_C4_Template.pdf") == "TECHKON TCS USA 325 C4 Template"
+    assert core.default_stp_title("") == "TECHKON ColorBar"
+    res = core.analyze_for_web(build_pdf("horizontal"), name="my_sheet.pdf")
+    assert res["stp_title"] == "TECHKON my sheet" and res["stp_inkzone_mm"] == 32.5

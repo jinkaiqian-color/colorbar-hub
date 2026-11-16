@@ -46,6 +46,20 @@ self.onmessage = async (event) => {
   const { id, type } = event.data;
   try {
     const py = await ready;
+    if (type === "stp") {
+      // Techkon STP text for one bar, built by the same Python engine
+      py.globals.set("stp_args", JSON.stringify({
+        cand: event.data.cand, title: event.data.title, inkzone: event.data.inkzone, use_labels: event.data.use_labels,
+      }));
+      const out = py.runPython(
+        "import json, colorbar_core\n" +
+        "a = json.loads(stp_args)\n" +
+        "text, notes = colorbar_core.build_stp(a['cand'], a['title'], a['inkzone'], a['use_labels'])\n" +
+        "json.dumps({'text': text, 'notes': notes})"
+      );
+      post({ id, ok: true, result: JSON.parse(out) });
+      return;
+    }
     if (type !== "analyze") throw new Error("Unknown request: " + type);
 
     post({ type: "status", text: "Reading the PDF" });

@@ -5,6 +5,7 @@ Command-line wrapper around colorbar_core.
     python colorbar_hub.py sheet.pdf          # readable summary
     python colorbar_hub.py sheet.pdf --json   # full result as JSON
     python colorbar_hub.py sheet.pdf --xml    # the bar as an XML document
+    python colorbar_hub.py sheet.pdf --stp --title "TECHKON TCS 325 C4" > strip.stp   # a Techkon STP strip
 """
 import argparse
 import json
@@ -65,11 +66,23 @@ def main():
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--xml", action="store_true", help="print the bar as an XML document")
     ap.add_argument("--as-drawn", action="store_true",
-                    help="with --xml: keep each patch as drawn where a printed label disagrees with it")
+                    help="with --xml or --stp: keep each patch as drawn where a printed label disagrees with it")
+    ap.add_argument("--stp", action="store_true", help="print the bar as a Techkon STP strip file")
+    ap.add_argument("--title", help="with --stp: the strip name on the first line (default: TECHKON plus the file name)")
+    ap.add_argument("--inkzone", type=float, default=core.STP_INKZONE_MM,
+                    help="with --stp: the inkzone width in mm (default %(default)s)")
     a = ap.parse_args()
     res = core.analyze(a.pdf)
     if a.json:
         print(json.dumps(res, indent=2))
+    elif a.stp:
+        if not res["candidates"]:
+            sys.exit("No linear color bar found.")
+        text, notes = core.build_stp(res["candidates"][0], a.title or core.default_stp_title(res["file"]),
+                                     a.inkzone, use_labels=not a.as_drawn)
+        sys.stdout.buffer.write(text.encode("ascii", "replace"))      # exact bytes: CRLF line ends, no final newline
+        for n in notes:
+            print("note:", n, file=sys.stderr)
     elif a.xml:
         if not res["candidates"]:
             sys.exit("No linear color bar found.")

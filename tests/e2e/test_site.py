@@ -121,3 +121,24 @@ def test_sd_patches_are_listed_and_written_as_slur_patches(base_url, tmp_path):
         xml = open(d.value.path(), encoding="utf-8").read()
         assert 'Type="Slur"' in xml and "P_0\u00b0K" in xml and "P_90\u00b0K" in xml
         browser.close()
+
+
+def test_the_stp_can_be_downloaded_with_an_edited_name_and_inkzone(base_url):
+    with playwright.sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(base_url)
+        page.wait_for_selector("#engine.ready", timeout=240_000)
+        page.click("#sample")
+        page.wait_for_selector("#out.on", timeout=120_000)
+        assert page.input_value("#stpTitle") == "TECHKON sample bar" and page.input_value("#stpZone") == "32.5"
+        page.fill("#stpTitle", "TECHKON TEST STRIP")
+        page.fill("#stpZone", "40")
+        with page.expect_download() as d:
+            page.click("#dlStp")
+        raw = open(d.value.path(), "rb").read()
+        assert d.value.suggested_filename == "TECHKON_TEST_STRIP.stp"
+        lines = raw.decode("ascii").split("\r\n")
+        assert lines[:5] == ["TECHKON TEST STRIP", "Number Patches,18", "Number Colors,5", "Default Width,4.00000", "Inkzone Width,40.00000"]
+        assert lines[-1] == "END_STRIP" and not raw.endswith(b"\n")
+        browser.close()

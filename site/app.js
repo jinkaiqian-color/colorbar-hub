@@ -6,7 +6,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 
 const PDFJS_BASE = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/";
 
-const S = { useLabels: true, res: null, sel: 0, tab: "ext", file: null, pdfDoc: null, crops: new Map(), zoomUser: false, zoomVal: 4, seconds: 0 };
+const S = { stpTitle: "", stpZone: "32.5", useLabels: true, res: null, sel: 0, tab: "ext", file: null, pdfDoc: null, crops: new Map(), zoomUser: false, zoomVal: 4, seconds: 0 };
 
 // ---- link to the source repo when hosted on GitHub Pages ------------------------------------
 (() => {
@@ -116,6 +116,7 @@ async function run(file) {
     const res = await request({ type: "analyze", buffer: buf, name: file.name }, [buf]);
     S.seconds = (performance.now() - t0) / 1000;
     S.res = res; S.sel = 0; S.file = file; S.zoomUser = false; S.tab = "ext"; S.useLabels = true;
+    S.stpTitle = res.stp_title || "TECHKON"; S.stpZone = String(res.stp_inkzone_mm || 32.5);
     res.file = file.name;
     drop.classList.add("compact");
     $("#dropInner").innerHTML = "<span><strong>" + esc(file.name) + "</strong> &nbsp; " + res.page.w_mm + " × " + res.page.h_mm + " mm</span><span>Choose another PDF</span>";
@@ -197,6 +198,10 @@ function render() {
   }
   (asDrawn ? c.xml_as_drawn_notes : c.xml_notes || []).forEach((n) => (h += '<div class="warn">XML: ' + esc(n) + "</div>"));
   h += '<div class="btnrow"><button class="btn" id="dlXml">Download XML</button></div>';
+  h += '<div class="stp"><h3>Techkon STP</h3>' +
+    '<label>Strip name<input id="stpTitle" type="text" value="' + esc(S.stpTitle) + '"></label>' +
+    '<label>Inkzone width (mm)<input id="stpZone" type="number" min="0" step="0.1" value="' + esc(S.stpZone) + '"></label>' +
+    '<div class="btnrow"><button class="btn alt" id="dlStp">Download STP</button></div><div id="stpNotes"></div></div>';
   const ig = S.res.ignored;
   h += "<details><summary>What was ignored</summary><ul>";
   h += "<li>" + ig.images + " images</li><li>" + ig.text_runs + " text runs</li>";
@@ -210,6 +215,23 @@ function render() {
 
   const cs = $("#cs");
   if (cs) cs.onchange = () => { S.sel = +cs.value; S.zoomUser = false; render(); };
+  $("#stpTitle").oninput = (e) => { S.stpTitle = e.target.value; };
+  $("#stpZone").oninput = (e) => { S.stpZone = e.target.value; };
+  $("#dlStp").onclick = async () => {
+    const box = $("#stpNotes");
+    box.innerHTML = "";
+    try {
+      const k = JSON.parse(JSON.stringify(cand()));
+      delete k.xml; delete k.xml_as_drawn; delete k.xml_notes; delete k.xml_as_drawn_notes;
+      const zone = parseFloat(S.stpZone);
+      const out = await request({ type: "stp", cand: k, title: S.stpTitle, inkzone: isFinite(zone) && zone > 0 ? zone : 32.5, use_labels: S.useLabels });
+      const name = (S.stpTitle.trim() || "colorbar").replace(/[^A-Za-z0-9._-]+/g, "_") + ".stp";
+      download(name, out.text, "text/plain");
+      box.innerHTML = out.notes.map((n) => '<div class="warn">STP: ' + esc(n) + "</div>").join("");
+    } catch (err) {
+      box.innerHTML = '<div class="warn">The STP file could not be built: ' + esc(err.message) + "</div>";
+    }
+  };
   const ul = $("#useLabels");
   if (ul) ul.onchange = () => { S.useLabels = ul.checked; render(); };
   $("#dlXml").onclick = () => download("colorbar_" + S.res.file.replace(/\.pdf$/i, "") + ".xml",
