@@ -205,14 +205,14 @@ def test_a_single_spot_ink_is_slot_5_in_either_direction():
         assert [(s["label"], s["ink_slot"]) for s in c["spots"]] == [("S1", 5)]
 
 
-def test_a_tint_between_the_standard_ones_is_warned_about_and_written_as_the_nearest():
+def test_a_tint_outside_the_bars_tint_set_is_warned_about_and_written_as_nu():
     import xml.etree.ElementTree as ET
     res = core.analyze_for_web(build_pdf("horizontal", markers=("k60",)))
     c = res["candidates"][0]
-    assert any(w.startswith("K has a 60% patch at slot 7") for w in c["warnings"])
-    assert any("K 60% is written as 50% (P_HK)" in n for n in c["xml_notes"])
+    assert any(w.startswith("K has a 60% patch at slot 7") and "25, 50 and 75%" in w for w in c["warnings"])
+    assert any("K 60% is not one of the tints in this bar (25, 50 and 75%), so it is written as NU" in n for n in c["xml_notes"])
     root = ET.fromstring(c["xml"])
-    assert [t.get("rRef") for t in root.find("TemplatePatches")][6] == "P_HK"
+    assert [t.get("rRef") for t in root.find("TemplatePatches")][6] == "P_NU"
 
 
 def test_standard_tints_raise_no_warning():
@@ -226,24 +226,36 @@ def fake(slot, kind, inks=(), label=None):
             "inks": [{"ink": n, "tint": t} for n, t in inks], "parts": [], "detail": ""}
 
 
-def test_overprints_balances_and_odd_combinations():
+def test_cmy_patches_are_gray_balance_at_any_percentage_and_other_combinations_are_nu():
     import xml.etree.ElementTree as ET
     patches = [fake(1, "ink", [("C", 100), ("M", 100)]), fake(2, "ink", [("C", 100), ("Y", 100)]),
                fake(3, "ink", [("M", 100), ("Y", 100)]), fake(4, "ink", [("C", 100), ("M", 100), ("Y", 100)]),
                fake(5, "ink", [("C", 25), ("M", 19), ("Y", 19)]), fake(6, "ink", [("C", 75), ("M", 66), ("Y", 66)]),
-               fake(7, "ink", [("C", 30), ("M", 20), ("Y", 20)]), fake(8, "nu", label="NU"),
-               {**fake(9, "split", [], "K2 / K3"), "parts": [{}]}]
-    cand = {"patches": patches, "patch_w_mm": 3.0, "patch_h_mm": 5.0, "spots": []}
+               fake(7, "ink", [("C", 30), ("M", 20), ("Y", 20)]), fake(8, "ink", [("C", 75), ("M", 64), ("Y", 64)]),
+               fake(9, "ink", [("C", 50), ("M", 50), ("Y", 50), ("K", 20)]), fake(10, "nu", label="NU"),
+               {**fake(11, "split", [], "K2 / K3"), "parts": [{}]},
+               fake(12, "ink", [("C", 50), ("K", 50)]), fake(13, "ink", [("K", 100), ("C", 100)]),
+               fake(14, "ink", [("C", 50), ("M", 50)])]
+    cand = {"patches": patches, "patch_w_mm": 3.0, "patch_h_mm": 5.0, "spots": [], "tint_region": "US"}
     xml, notes = core.build_xml({"file": "x.pdf"}, cand)
     root = ET.fromstring(xml)
     assert [t.get("rRef") for t in root.find("TemplatePatches")] == [
-        "P_CM", "P_CY", "P_MY", "P_CMY", "P_HC_CMY", "P_SC_CMY", "P_C30_M20_Y20", "P_NU", "P_NU"]
+        "P_CM", "P_CY", "P_MY",                              # the three two-ink overprints stay overprints
+        "P_100%C100%M100%Y",                                 # CMY at 100% is gray balance
+        "P_HC_CMY", "P_SC_CMY",                              # the named triples keep their types
+        "P_30%C20%M20%Y", "P_75%C64%M64%Y", "P_20%K50%C50%M50%Y",   # any other CMY patch, with its percentages
+        "P_NU", "P_NU", "P_NU", "P_NU", "P_NU"]
     d = {t.get("ID"): t for t in root.find("ReferencePatches")}
-    assert d["P_CM"].get("Type") == "Overprint"
-    assert [e.get("Slot") for e in d["P_CY"].iter("PatchTypeData") if e.get("Slot")] == ["2", "4"]
+    bal = d["P_75%C64%M64%Y"]
+    assert bal.get("Type") == "Balance" and bal.find("PatchTypeData").get("GrayBalanceType") == "NotSet"
+    assert [(e.get("Slot"), e.get("Raster"), e.get("Type")) for e in bal.iter("PatchTypeData") if e.get("Slot")] == [
+        ("2", "0.75", "Tint"), ("3", "0.64", "Tint"), ("4", "0.64", "Tint")]
+    full = d["P_100%C100%M100%Y"].find("PatchTypeData")
+    assert full.get("GrayBalanceType") == "NotSet" and [e.get("Raster") for e in full.iter("PatchTypeData") if e.get("Slot")] == ["1", "1", "1"]
+    assert [e.get("Slot") for e in d["P_20%K50%C50%M50%Y"].iter("PatchTypeData") if e.get("Slot")] == ["1", "2", "3", "4"]
     assert d["P_HC_CMY"].find("PatchTypeData").get("GrayBalanceType") == "HighlightContrast"
-    assert d["P_SC_CMY"].find("PatchTypeData").get("GrayBalanceType") == "ShadowContrast"
-    assert len(notes) == 2 and any("generic overprint" in n for n in notes) and any("written as NU" in n for n in notes)
+    assert d["P_CY"].get("Type") == "Overprint" and "P_CMY" not in d
+    assert len(notes) == 4 and any("written as NU" in n for n in notes) and any("split into several parts" in n for n in notes)
 
 
 def test_the_given_file_name_is_used_in_the_result_and_the_xml():
@@ -779,3 +791,102 @@ def test_the_default_stp_title_comes_from_the_file_name():
     assert core.default_stp_title("") == "TECHKON ColorBar"
     res = core.analyze_for_web(build_pdf("horizontal"), name="my_sheet.pdf")
     assert res["stp_title"] == "TECHKON my sheet" and res["stp_inkzone_mm"] == 32.5
+
+
+# ---- tint sets: US 25/50/75, Europe 20/40/80 ----------------------------------------------------------------
+
+def test_the_tint_set_is_chosen_from_the_tints_in_the_bar():
+    assert core.tint_region([25, 50, 75, 25, 50, 75]) == "US"
+    assert core.tint_region([20, 40, 80, 20, 40, 80]) == "Europe"
+    assert core.tint_region([]) == "US"                          # no tints: the US values
+    assert core.tint_region([20, 40, 80, 25]) == "Europe" and core.tint_region([25, 50, 75, 20]) == "US"
+    assert core.tint_region([25, 40]) == "US"                    # a tie goes to the US set
+    assert core.tint_region([13, 60]) == "US"
+
+
+def test_a_bar_with_european_tints_is_written_with_the_european_rasters():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal", markers=("europe",))
+    assert c["tint_region"] == "Europe" and c["tints"] == [20, 40, 80] and c["warnings"] == []
+    root = ET.fromstring(c["xml"])
+    d = {t.get("ID"): t.find("PatchTypeData").attrib for t in root.find("ReferencePatches")}
+    assert d["P_Q1"] == {"Slot": "5", "Raster": "0.2", "RasterClass": "1"}
+    assert d["P_H1"] == {"Slot": "5", "Raster": "0.4", "RasterClass": "2"}
+    assert d["P_T1"] == {"Slot": "5", "Raster": "0.8", "RasterClass": "3"}
+    assert d["P_HK"] == {"Slot": "1", "Raster": "0.4", "RasterClass": "2"}
+    r = {x.get("Type"): x.get("Value") for x in root.find("RasterSettings")}
+    assert (r["Quarter"], r["Half"], r["ThreeQuarter"]) == ("0.2", "0.4", "0.8")
+    assert (r["HighlightContrast_K"], r["HighlightRange_K"], r["ShadowContrast_K"]) == ("0.25", "0.5", "0.75")
+    assert root.find("RasterSettings").get("HighlightContrast_CMY") == "0.25 0.19 0.19 0"
+
+
+def test_a_bar_with_us_tints_keeps_the_us_rasters():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal")
+    assert c["tint_region"] == "US" and c["tints"] == [25, 50, 75]
+    r = {x.get("Type"): x.get("Value") for x in ET.fromstring(c["xml"]).find("RasterSettings")}
+    assert (r["Quarter"], r["Half"], r["ThreeQuarter"]) == ("0.25", "0.5", "0.75")
+
+
+def test_tints_of_the_other_market_in_a_bar_are_not_used():
+    patches = [fake(1, "ink", [("K", 100)]), fake(2, "ink", [("K", 25)]), fake(3, "ink", [("K", 50)]),
+               fake(4, "ink", [("K", 75)]), fake(5, "ink", [("K", 20)]), fake(6, "ink", [("K", 13)])]
+    cand = {"patches": patches, "patch_w_mm": 3.0, "patch_h_mm": 5.0, "spots": [], "tint_region": "US"}
+    xml, notes = core.build_xml({"file": "x.pdf"}, cand)
+    import xml.etree.ElementTree as ET
+    assert [t.get("rRef") for t in ET.fromstring(xml).find("TemplatePatches")] == ["P_K", "P_QK", "P_HK", "P_TK", "P_NU", "P_NU"]
+    assert len(notes) == 2 and all("not one of the tints in this bar (25, 50 and 75%)" in n for n in notes)
+    cand["tint_region"] = "Europe"                                # the same patches in a European bar
+    xml, notes = core.build_xml({"file": "x.pdf"}, cand)
+    assert [t.get("rRef") for t in ET.fromstring(xml).find("TemplatePatches")] == ["P_K", "P_NU", "P_NU", "P_NU", "P_QK", "P_NU"]
+
+
+def test_a_printed_label_must_be_in_the_bars_tint_set_to_be_followed():
+    p = fake(1, "ink", [("K", 100)])
+    p["label_pct"] = 40
+    cand = {"patches": [p], "patch_w_mm": 3.0, "patch_h_mm": 5.0, "spots": [], "tint_region": "Europe"}
+    import xml.etree.ElementTree as ET
+    xml, _ = core.build_xml({"file": "x.pdf"}, cand)
+    assert [t.get("rRef") for t in ET.fromstring(xml).find("TemplatePatches")] == ["P_HK"]    # 40% is a European half tone
+    cand["tint_region"] = "US"
+    xml, _ = core.build_xml({"file": "x.pdf"}, cand)
+    assert [t.get("rRef") for t in ET.fromstring(xml).find("TemplatePatches")] == ["P_K"]     # not a US tint: the label is not followed
+
+
+# ---- slur / doubling patches drawn as images (Heidelberg control strips) ---------------------------------------
+
+def test_a_one_row_bitmap_of_alternating_pixels_is_an_sd_patch():
+    c = one(orientation="horizontal", markers=("sd_image_pair",))
+    v, h = c["patches"][8], c["patches"][9]
+    assert (v["kind"], v["label"]) == ("lines", "S/D vertical lines C100")
+    assert (h["kind"], h["label"]) == ("lines", "S/D horizontal lines C100")
+    assert v["lines"]["count"] == 25 and h["lines"]["count"] == 37
+    assert approx(v["lines"]["width_mm"], 0.08, 0.002) and approx(v["lines"]["pitch_mm"], 0.16, 0.002)
+    assert c["counts"]["sd"] == 2 and c["counts"]["nu"] == 0         # the images are not marks either
+    assert v["inks"] == [{"ink": "C", "tint": 100}]
+
+
+def test_image_sd_patches_are_written_like_stroke_sd_patches():
+    import xml.etree.ElementTree as ET
+    c = one(orientation="horizontal", markers=("sd_image_pair",))
+    root = ET.fromstring(c["xml"])
+    assert [t.get("rRef") for t in root.find("TemplatePatches")][8:10] == ["P_0\u00b0C", "P_90\u00b0C"]
+    d = {t.get("ID"): t.find("PatchTypeData").attrib for t in root.find("ReferencePatches")}
+    assert d["P_0\u00b0C"] == {"Slot": "2", "Type": "Vertical"} and d["P_90\u00b0C"] == {"Slot": "2", "Type": "Horizontal"}
+    rows = [r.split(",\t") for r in core.build_stp(c, "T")[0].split("\r\n") if r[:1].isdigit()]
+    assert rows[8][2:] == ["SD0", "100", "0", "0", "0", "0"] and rows[9][2:] == ["SD90", "100", "0", "0", "0", "0"]
+
+
+def test_an_image_that_is_not_a_line_pattern_stays_nu():
+    c = one(orientation="horizontal", markers=("image_checker",))
+    assert c["patches"][8]["kind"] == "nu" and c["patches"][8]["detail"] == "1 image"
+    assert c["counts"]["sd"] == 0
+
+
+def test_image_sd_patches_work_on_a_vertical_bar_and_in_repeats():
+    c = one(orientation="vertical", markers=("sd_image_pair",))
+    assert [(p["slot"], p["lines"]["direction"]) for p in c["patches"] if p["kind"] == "lines"] == [(9, "vertical"), (10, "horizontal")]
+    single = one(orientation="horizontal", markers=("sd_image_pair",))
+    for kw in ({"repeat": (3, 72.0)}, {"repeat": (3, 75.5), "as_form": True}):
+        r = one(orientation="horizontal", markers=("sd_image_pair",), **kw)
+        assert r["repeat"]["copies_along"] == 3 and r["xml"] == single["xml"], kw

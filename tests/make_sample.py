@@ -23,6 +23,10 @@ Marker cells (for the NU rules) can be added with markers=(...):
                     lines (slot 9), K 100%, 0.125 mm lines every 0.25 mm, drawn as strokes
   "sd_pair_spot"    the same pair in the first spot ink
   "few_lines"       only four vertical lines in slot 8 -> too few to be a line patch
+  "europe"          the tints are 20, 40 and 80% (the European set): K40 in slot 7, S1 20, 40, 80
+  "sd_image_pair"   a slur/doubling pair in slots 8 and 9 drawn as one-row bitmaps (0 1 0 1 ...) in a cyan
+                    Separation color space, the second one rotated 90 degrees, like Heidelberg control strips
+  "image_checker"   an 8 x 8 checkerboard bitmap in slot 8 -> an image, but not a line pattern -> NU
   "ladder"          the last slot is a white patch with four stacked tint bars (K 2, 3, 4, 5%) over it,
                     like the tint ladder in the TCS C4 template -> one slot, never a separate bar
   "second_spot"     the C100 patch in slot 2 is drawn in a second spot ink, which therefore appears
@@ -136,10 +140,10 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
     if with_bar:
         # (kind, values) per slot; None = empty slot
         group1 = [("k", (0, 0, 0, 1)), ("s2", 1.0) if "second_spot" in markers else ("k", (1, 0, 0, 0)), ("k", (0, 1, 0, 0)), ("k", (0, 0, 1, 0)),
-                  ("s", 1.0), ("k", (0.5, 0.4, 0.4, 0)), ("k", (0, 0, 0, 0.6 if "k60" in markers else 0.5)), ("k", (0, 0, 0, 0))]
+                  ("s", 1.0), ("k", (0.5, 0.4, 0.4, 0)), ("k", (0, 0, 0, 0.6 if "k60" in markers else 0.4 if "europe" in markers else 0.5)), ("k", (0, 0, 0, 0))]
         group2 = [("k", (0, 0, 0, 1)), ("k", (1, 0, 0, 0)), ("k", (0, 1, 0, 0)), ("k", (0, 0, 1, 0)),
-                  ("s", 1.0), ("s", 0.25), ("s", 0.5),
-                  ("k", (0, 0, 0, 0)) if "ladder" in markers else ("s", 0.75)]
+                  ("s", 1.0), ("s", 0.2 if "europe" in markers else 0.25), ("s", 0.4 if "europe" in markers else 0.5),
+                  ("k", (0, 0, 0, 0)) if "ladder" in markers else ("s", 0.8 if "europe" in markers else 0.75)]
         slots = group1 + [None, None] + group2
         x0, y0 = 14.0, 8.0  # bar start (left edge / bottom edge) in mm
         for i, s in enumerate(slots):
@@ -193,6 +197,14 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
                 lines_patch(9, "horizontal", spot=mk == "sd_pair_spot")
             elif mk == "few_lines":
                 lines_patch(8, "vertical", count=4)
+            elif mk == "sd_image_pair":
+                vx, vy, vw, vh = cell_rect(8)
+                hx, hy, hw, hh = cell_rect(9)
+                c.append("q %s 0 0 %s %s %s cm /ImV Do Q" % (_n(vw * MM), _n(vh * MM), _n(vx * MM), _n(vy * MM)))
+                c.append("q 0 %s %s 0 %s %s cm /ImH Do Q" % (_n(hh * MM), _n(hw * MM), _n(hx * MM), _n(hy * MM)))
+            elif mk == "image_checker":
+                kx, ky, kw, kh = cell_rect(8)
+                c.append("q %s 0 0 %s %s %s cm /ImK Do Q" % (_n(kw * MM), _n(kh * MM), _n(kx * MM), _n(ky * MM)))
             elif mk == "ladder":
                 lx = x0 + (len(slots) - 1) * PATCH_ALONG
                 for j, tint in enumerate((0.02, 0.03, 0.04, 0.05)):
@@ -262,14 +274,30 @@ def build_pdf(orientation="horizontal", with_bar=True, rgb_decoy=True, corner_ma
     extra = (" /CSspot2 " + _sep("Sample#20Green", "0.93 0 1 0")) if "second_spot" in markers else ""
     res = ("<< /Font << /F1 5 0 R >> /ColorSpace << /CSdie %s /CSall %s /CSspot %s%s >> >>" % (
         _sep("Dieline", "0 1 1 0"), _sep("All", "1 1 1 1"), _sep("Sample#20Orange", "0 0.52 1 0"), extra))
-    page_res = (res[:-3] + " /XObject << /Fm1 6 0 R >> >>") if form is not None else res
+    uses_images = any(m in markers for m in ("sd_image_pair", "image_checker"))
+    img_entries = " /ImV 8 0 R /ImH 9 0 R /ImK 10 0 R" if uses_images else ""
+    res_form = (res[:-3] + " /XObject <<%s >> >>" % img_entries) if uses_images else res
+    xo_entries = img_entries + (" /Fm1 6 0 R" if form is not None else "")
+    page_res = (res[:-3] + " /XObject <<%s >> >>" % xo_entries) if xo_entries else res
     objs[3] = ("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Resources %s /Contents 4 0 R >>" % (
         _n(page_w * MM), _n(page_h * MM), page_res)).encode("latin-1")
     objs[4] = b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
     objs[5] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
     if form is not None:
         objs[6] = (b"<< /Type /XObject /Subtype /Form /BBox [-5000 -5000 20000 20000] /Resources %s /Length %d >>\nstream\n"
-                   % (res.encode("latin-1"), len(form))) + form + b"\nendstream"
+                   % (res_form.encode("latin-1"), len(form))) + form + b"\nendstream"
+    if uses_images:
+        cyan = "[/Separation /Cyan /DeviceCMYK << /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [1 0 0 0] /N 1 >>]"
+
+        def image(width, height, rows):
+            return (("<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s /BitsPerComponent 1 "
+                     "/Length %d >>\nstream\n" % (width, height, cyan, len(rows))).encode("latin-1")
+                    + rows + b"\nendstream")
+        objs[8] = image(50, 1, b"\x55" * 7)                  # 50 pixels: 0 1 0 1 ... -> 25 lines
+        objs[9] = image(75, 1, b"\x55" * 10)                 # 75 pixels -> 37 lines
+        objs[10] = image(8, 8, b"\xaa\x55" * 4)               # a checkerboard
+        objs.setdefault(6, b"null")                          # keep the object numbers consecutive
+        objs.setdefault(7, b"null")
 
     out = bytearray(b"%PDF-1.4\n")
     offsets = {}

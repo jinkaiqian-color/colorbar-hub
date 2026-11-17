@@ -177,6 +177,7 @@ function render() {
   h += "<dt>Paper white</dt><dd>" + c.counts.paper + "</dd>";
   h += "<dt>NU (not used)</dt><dd>" + c.counts.nu + "</dd>";
   if (c.counts.sd) h += "<dt>S/D patches</dt><dd>" + c.counts.sd + "</dd>";
+  if (c.tints && c.tints.length) h += "<dt>Tint set</dt><dd>" + c.tint_region + " (" + c.tints.join(", ") + "%)</dd>";
   h += "<dt>Bar length</dt><dd>" + fmt(c.length_mm, 2) + " mm</dd>";
   h += "<dt>Bar starts, from left</dt><dd>" + fmt(c.start_mm.x, 2) + " mm</dd>";
   h += "<dt>Bar starts, from top</dt><dd>" + fmt(c.start_mm.y, 2) + " mm</dd>";

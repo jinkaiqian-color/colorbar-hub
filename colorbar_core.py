@@ -43,7 +43,7 @@ from collections import Counter
 from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
-__version__ = "1.9.0"
+__version__ = "2.0.0"
 
 PT2MM = 25.4 / 72.0
 MM2PT = 72.0 / 25.4
@@ -362,6 +362,7 @@ class Collector:
         self.shapes = []  # everything else that marks the page: curves, outlines, text, images
         self.texts = []   # the strings written on the page, each with the centre of where it is drawn
         self.lines = []   # straight, axis-aligned stroked lines: end points, width and ink
+        self.images = []  # every image drawn: its XObject, matrix and the fill in force (decoded later, only if small)
         self.stats = Counter()
         self._cs_cache = {}
 
@@ -542,7 +543,7 @@ class Collector:
             return
         if sub == "/Image":
             self.stats["images"] += 1
-            self._image(gs)
+            self._image(gs, xo)
             return
         if sub != "/Form" or depth > 12:
             return
@@ -576,8 +577,11 @@ class Collector:
                     self.lines.append({"xa": xa, "ya": ya, "xb": xb, "yb": yb, "w": gs.lw * scale,
                                        "stroke": Fill(gs.stroke.cs, list(gs.stroke.vals))})
 
-    def _image(self, gs):
+    def _image(self, gs, xo=None):
         self._add_shape("image", [mapply(gs.ctm, x, y) for x, y in ((0, 0), (1, 0), (1, 1), (0, 1))])
+        if xo is not None and self.shapes:
+            self.shapes[-1]["img"] = len(self.images)
+            self.images.append({"xo": xo, "ctm": gs.ctm, "fill": Fill(gs.fill.cs, list(gs.fill.vals))})
 
     def _text(self, operands, op, m, font_size):
         n = 0
@@ -730,6 +734,99 @@ def find_bars(rects, page_w, page_h, include_rgb=False):
     return found
 
 
+# --------------------------------------------------------------------------
+# Line patterns drawn as images
+# --------------------------------------------------------------------------
+# Some files draw a slur/doubling patch as a one-row bitmap (for example 63 x 1 pixels, 0 1 0 1 ...)
+# stretched over the cell. Such an image is turned into the same straight-line records the stroke
+# reader produces, so everything downstream (cells, spacing checks, XML, STP) treats both the same.
+IMG_MAX_PIXELS = 40000
+
+
+def _image_pattern(im):
+    """Lines for one image that is a line pattern, or None."""
+    xo, (a, b, c_, d, e, f) = im["xo"], im["ctm"]
+    w, h = int(xo["/Width"]), int(xo["/Height"])
+    if w * h > IMG_MAX_PIXELS or (w < 5 and h < 5):
+        return None
+    mask = bool(xo.get("/ImageMask", False))
+    bpc = 1 if mask else int(xo.get("/BitsPerComponent", 8))
+    if bpc not in (1, 8):
+        return None
+    dec = _floats(xo.get("/Decode", []), [])
+    invert = len(dec) >= 2 and dec[0] > dec[1]
+    if mask:
+        ink, painted = im["fill"], (lambda v: v < 0.5)               # sample 0 paints the fill color
+    else:
+        cs = parse_colorspace(xo["/ColorSpace"])
+        if cs["type"] == "Separation" and len(cs["names"]) == 1:
+            ink, painted = Fill(cs, [1.0]), (lambda v: v >= 0.5)    # sample 1 is the full tint
+        elif cs["type"] == "DeviceGray":
+            ink, painted = Fill(DEVICE_CS["DeviceGray"], [0.0]), (lambda v: v < 0.5)
+        else:
+            return None
+    data = xo.get_data()
+    row_bytes = (w * bpc + 7) // 8
+    if len(data) < row_bytes * h:
+        return None
+
+    def on(x, y):
+        if bpc == 1:
+            v = float((data[y * row_bytes + x // 8] >> (7 - x % 8)) & 1)
+        else:
+            v = data[y * row_bytes + x] / 255.0
+        return painted(1.0 - v if invert else v)
+
+    rows = [[on(x, y) for x in range(w)] for y in range(h)]
+    if all(r == rows[0] for r in rows):                              # every row the same: the pattern runs along x
+        seq, axis = rows[0], "x"
+    elif all(len(set(r)) == 1 for r in rows):                        # every column the same: it runs along y
+        seq, axis = [r[0] for r in rows], "y"
+    else:
+        return None
+    n = len(seq)
+    runs, i = [], 0
+    while i < n:
+        if seq[i]:
+            j = i
+            while j < n and seq[j]:
+                j += 1
+            runs.append((i, j - i))
+            i = j
+        else:
+            i += 1
+    if len(runs) < 5:
+        return None
+    px = (math.hypot(a, b) if axis == "x" else math.hypot(c_, d)) / n          # one pixel along the pattern, in pt
+    width = statistics.median(r[1] for r in runs) * px
+    out = []
+    for start, length in runs:
+        t = (start + length / 2) / n
+        if axis == "x":
+            (xa, ya), (xb, yb) = (a * t + e, b * t + f), (a * t + c_ + e, b * t + d + f)
+        else:
+            v = 1 - t
+            (xa, ya), (xb, yb) = (c_ * v + e, d * v + f), (a + c_ * v + e, b + d * v + f)
+        if not (abs(xa - xb) < 0.02 or abs(ya - yb) < 0.02):
+            return None                                              # rotated by something other than 90 degrees
+        out.append({"xa": xa, "ya": ya, "xb": xb, "yb": yb, "w": width, "stroke": ink, "tol": px})
+    return out
+
+
+def image_lines(images):
+    """-> (lines, indexes of the images that were line patterns). Large or other images are left alone."""
+    lines, converted = [], set()
+    for idx, im in enumerate(images):
+        try:
+            got = _image_pattern(im)
+        except Exception:
+            got = None
+        if got:
+            lines.extend(got)
+            converted.add(idx)
+    return lines, converted
+
+
 # A QR finder pattern is a 7x7 square with a 5x5 light square and a 3x3 square inside it,
 # all sharing one centre. The ratios below allow for small drawing tolerances.
 MARK_MIN_MM, MARK_MAX_MM = 1.5, 15.0
@@ -774,7 +871,25 @@ def find_corner_marks(rects):
     return marks
 
 
-STD_TINTS = {25: ("Q", 1), 50: ("H", 2), 75: ("T", 3)}      # tint -> (ID letter, RasterClass)
+# Quarter, half and three-quarter tones are 25, 50 and 75% in the US and 20, 40 and 80% in Europe.
+# tint -> (ID letter, RasterClass) for each market.
+TINT_CLASSES = {
+    "US": {25: ("Q", 1), 50: ("H", 2), 75: ("T", 3)},
+    "Europe": {20: ("Q", 1), 40: ("H", 2), 80: ("T", 3)},
+}
+
+
+def tint_region(tints):
+    """Which tint set a bar follows, from the single-ink tints it holds. Europe only when more of its tints
+    are 20, 40 or 80% than 25, 50 or 75%; the US set otherwise (also when there are no tints)."""
+    us = sum(1 for t in tints if t in TINT_CLASSES["US"])
+    eu = sum(1 for t in tints if t in TINT_CLASSES["Europe"])
+    return "Europe" if eu > us else "US"
+
+
+def _tint_text(region):
+    k = sorted(TINT_CLASSES[region])
+    return f"{k[0]}, {k[1]} and {k[2]}%"
 NU_RGB = (223, 227, 232)
 MIN_MARK_MM = 0.04          # anything smaller than this is treated as a drawing artifact
 PART_SPAN = 0.9             # a filled rectangle this wide across the cell is a part of the cell, not a mark
@@ -987,7 +1102,8 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
             step = statistics.median(steps)
             width_pt = statistics.median(x[1]["w"] for x in items)
             span = (plen if across else pthick)        # the cell's size in the direction the lines are spread
-            if step <= 1.05 * width_pt or any(abs(d - step) > 0.25 * step for d in steps):
+            slack = max([0.25 * step] + [x[1].get("tol", 0.0) for x in items])   # image lines can be a pixel off
+            if step <= 1.05 * width_pt or any(abs(d - step) > slack for d in steps):
                 continue                               # not evenly spaced, or the lines would overlap into a solid
             if len(items) * step < 0.6 * span:
                 continue                               # fills only a corner of the cell
@@ -1150,13 +1266,14 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
     for p in inked:
         if len(p["inks"]) == 1:
             by_ink.setdefault(p["inks"][0]["ink"], []).append((p["slot"], p["inks"][0]["tint"]))
+    all_tints = [t for found in by_ink.values() for _sl, t in found if t < 100]
+    region = tint_region(all_tints)
     for ink, found in by_ink.items():
-        odd = [(sl, t) for sl, t in found if t not in STD_TINTS and t != 100]
+        odd = [(sl, t) for sl, t in found if t not in TINT_CLASSES[region] and t != 100]
         if odd:
-            others = sorted({t for _sl, t in found if t in STD_TINTS})
             more = f" (and {len(odd) - 1} more)" if len(odd) > 1 else ""
-            tail = ("; its other tints are " + ", ".join(f"{t}%" for t in others) + ".") if others else ". Standard tints are 25, 50 and 75%."
-            warnings.append(f"{ink} has a {odd[0][1]}% patch at slot {odd[0][0]}{more}{tail}")
+            warnings.append(f"{ink} has a {odd[0][1]}% patch at slot {odd[0][0]}{more}. "
+                            f"The tints in this bar are {_tint_text(region)} ({region}).")
 
     # ---- where reading starts ------------------------------------------------------------------
     if horizontal:
@@ -1196,6 +1313,8 @@ def build_candidate(ev, all_rects, shapes, page_w, page_h, cid, marks=(), texts=
         "slot_count": slot_count,
         "counts": {"ink": counts["ink"] + counts["split"], "paper": counts["paper"], "nu": counts["nu"],
                    "sd": counts["lines"]},
+        "tint_region": region,
+        "tints": sorted({t for t in all_tints}),
         "empty_slots": [p["slot"] for p in patches if p["empty"]],
         "length_mm": round(slot_count * pitch * PT2MM, 3),
         "origin_mm": {"x": round(bx0 * PT2MM, 2), "y": round(top0 * PT2MM, 2)},
@@ -1409,8 +1528,11 @@ def analyze(source, name=None):
             production += 1
         rects.append(r)
 
+    img_lines, converted = image_lines(col.images)       # line patterns drawn as images become lines
     shapes = []
     for sh in col.shapes:
+        if sh.get("img") in converted:
+            continue                                     # that image is a line pattern, not a mark
         sh = dict(sh)
         sh["x0"] -= llx
         sh["x1"] -= llx
@@ -1418,7 +1540,7 @@ def analyze(source, name=None):
         sh["y1"] -= lly
         shapes.append(sh)
     texts = [dict(t, cx=t["cx"] - llx, cy=t["cy"] - lly) for t in col.texts]
-    lines = [dict(l, xa=l["xa"] - llx, xb=l["xb"] - llx, ya=l["ya"] - lly, yb=l["yb"] - lly) for l in col.lines]
+    lines = [dict(l, xa=l["xa"] - llx, xb=l["xb"] - llx, ya=l["ya"] - lly, yb=l["yb"] - lly) for l in col.lines + img_lines]
     marks = find_corner_marks(rects)
     found = find_bars(rects, page_w, page_h)
     if not found:
@@ -1489,11 +1611,15 @@ def analyze(source, name=None):
 PROCESS_SLOT = {"K": 1, "C": 2, "M": 3, "Y": 4}
 BALANCE = {(50, 40, 40): ("HR", "HighlightRange"), (25, 19, 19): ("HC", "HighlightContrast"),
            (75, 66, 66): ("SC", "ShadowContrast")}
-TINT_SNAP = 10          # a tint within this many points of 25, 50 or 75 is written as that tint
 RASTER_ATTRS = (("Balance", "0.5 0.4 0.4 0"), ("HighlightContrast_CMY", "0.25 0.19 0.19 0"),
                 ("HighlightRange_CMY", "0.5 0.4 0.4 0"), ("ShadowContrast_CMY", "0.75 0.66 0.66 0"))
-RASTERS = (("Quarter", "0.25"), ("Half", "0.5"), ("ThreeQuarter", "0.75"),
-           ("HighlightContrast_K", "0.25"), ("HighlightRange_K", "0.5"), ("ShadowContrast_K", "0.75"))
+
+
+def _rasters(region):
+    q, h, t = (sorted(TINT_CLASSES[region]))
+    return (("Quarter", f"{q / 100:g}"), ("Half", f"{h / 100:g}"), ("ThreeQuarter", f"{t / 100:g}"),
+            ("HighlightContrast_K", "0.25"), ("HighlightRange_K", "0.5"), ("ShadowContrast_K", "0.75"))
+
 _NU_DEF = {"type": "NotUsed", "ptd": {}}
 
 
@@ -1510,8 +1636,8 @@ def _dim(v):
     return f"{round(v / 0.0005) * 0.0005:.4f}".rstrip("0").rstrip(".") or "0"
 
 
-def _xml_patch(p, slot_of, notes, use_labels=True):
-    """The template ID and definition for one slot record."""
+def _xml_patch(p, slot_of, notes, use_labels=True, region="US"):
+    """The template ID and definition for one slot record. Anything the templates have no type for is NU."""
     kind = p["kind"]
     if kind == "split":
         notes.append(f"Slot {p['slot']} is split into several parts across the cell, so it is written as NU.")
@@ -1522,53 +1648,52 @@ def _xml_patch(p, slot_of, notes, use_labels=True):
         return "P_P", {"type": "Paper", "ptd": {"Slot": "0"}}
     inks = sorted(p["inks"], key=lambda i: slot_of[i["ink"]])
     sym = lambda i: i["ink"] if i["ink"] in PROCESS_SLOT else str(slot_of[i["ink"]] - 4)
+    if not inks:
+        notes.append(f"Slot {p['slot']} ({p['label']}) has no ink values, so it is written as NU.")
+        return "P_NU", _NU_DEF
     if kind == "lines":
         vertical = p["lines"]["direction"] == "vertical"
         return f"P_{'0' if vertical else '90'}\u00b0{sym(inks[0])}", {
             "type": "Slur", "ptd": {"Slot": str(slot_of[inks[0]["ink"]]), "Type": "Vertical" if vertical else "Horizontal"}}
+    classes = TINT_CLASSES[region]
     if len(inks) == 1:
         i = inks[0]
         t, s_, slot = i["tint"], sym(i), slot_of[i["ink"]]
         followed = None
         lp = p.get("label_pct")
-        if use_labels and lp is not None and (lp in STD_TINTS or lp == 100) and lp != t:
+        if use_labels and lp is not None and (lp in classes or lp == 100) and lp != t:
             followed = (p["slot"], lp, i["ink"], t)
             t = lp
         if t == 100:
             pid, d = f"P_{s_}", {"type": "Solid", "ptd": {"Slot": str(slot)}}
+        elif t in classes:
+            letter, cls = classes[t]
+            pid = f"P_{letter}{s_}"
+            d = {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(t / 100), "RasterClass": str(cls)}}
         else:
-            near = min(STD_TINTS, key=lambda k: abs(k - t))
-            if abs(near - t) <= TINT_SNAP:
-                letter, cls = STD_TINTS[near]
-                pid = f"P_{letter}{s_}"
-                d = {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(near / 100), "RasterClass": str(cls)}}
-                if near != t:
-                    notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is written as {near}% ({pid}), "
-                                 f"because the tints are 25, 50 and 75%.")
-            else:
-                pid = f"P_{t}{s_}"
-                d = {"type": "Tint", "ptd": {"Slot": str(slot), "Raster": _g(t / 100)}}
-                notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is not a 25, 50 or 75% tint, so it is written as its "
-                             f"own tint ({pid}) without a RasterClass.")
+            notes.append(f"Slot {p['slot']}: {i['ink']} {t}% is not one of the tints in this bar "
+                         f"({_tint_text(region)}), so it is written as NU.")
+            return "P_NU", _NU_DEF
         if followed:
             notes.append(("follow",) + followed + (pid,))      # grouped into one note per kind by build_xml
         return pid, d
+    names = {i["ink"] for i in inks}
     tints = tuple(i["tint"] for i in inks)
-    if all(t == 100 for t in tints):
+    if {"C", "M", "Y"} <= names:
+        # a patch with C, M and Y at any percentage is a gray-balance patch. The three named triples keep
+        # their types; every other one is written with its percentages in the ID and GrayBalanceType NotSet.
+        entries = [{"Slot": str(slot_of[i["ink"]]), "Raster": _g(i["tint"] / 100), "Type": "Tint"} for i in inks]
+        if names == {"C", "M", "Y"} and tints in BALANCE:
+            code, gb = BALANCE[tints]
+            return f"P_{code}_CMY", {"type": "Balance", "ptd": {"GrayBalanceType": gb}, "inks": entries}
+        return "P_" + "".join(f"{i['tint']}%{sym(i)}" for i in inks), {
+            "type": "Balance", "ptd": {"GrayBalanceType": "NotSet"}, "inks": entries}
+    if len(inks) == 2 and names <= {"C", "M", "Y"} and all(t == 100 for t in tints):
         return "P_" + "".join(sym(i) for i in inks), {
             "type": "Overprint", "ptd": {},
             "inks": [{"Slot": str(slot_of[i["ink"]]), "Type": "Solid"} for i in inks]}
-    if tuple(i["ink"] for i in inks) == ("C", "M", "Y") and tints in BALANCE:
-        code, gb = BALANCE[tints]
-        return f"P_{code}_CMY", {
-            "type": "Balance", "ptd": {"GrayBalanceType": gb},
-            "inks": [{"Slot": str(slot_of[i["ink"]]), "Raster": _g(i["tint"] / 100), "Type": "Tint"} for i in inks]}
-    pid = "P_" + "_".join(f"{sym(i)}{i['tint']}" for i in inks)
-    notes.append(f"Slot {p['slot']}: {p['label']} is not a known overprint or gray-balance patch, "
-                 f"so it is written as a generic overprint ({pid}).")
-    return pid, {"type": "Overprint", "ptd": {}, "inks": [
-        ({"Slot": str(slot_of[i["ink"]]), "Type": "Solid"} if i["tint"] == 100 else
-         {"Slot": str(slot_of[i["ink"]]), "Raster": _g(i["tint"] / 100), "Type": "Tint"}) for i in inks]}
+    notes.append(f"Slot {p['slot']}: {p['label']} is not a patch the templates have a type for, so it is written as NU.")
+    return "P_NU", _NU_DEF
 
 
 def build_xml(result, cand, use_labels=True):
@@ -1582,7 +1707,7 @@ def build_xml(result, cand, use_labels=True):
         slot_of[sp["label"]] = sp["ink_slot"]
     ids, defs = [], {}
     for p in cand["patches"]:
-        pid, d = _xml_patch(p, slot_of, notes, use_labels)
+        pid, d = _xml_patch(p, slot_of, notes, use_labels, cand.get("tint_region", "US"))
         ids.append(pid)
         defs.setdefault(pid, d)
 
@@ -1617,7 +1742,7 @@ def build_xml(result, cand, use_labels=True):
     for pid in ids:
         ET.SubElement(seq, "TemplatePatch", {"rRef": pid})
     rs = ET.SubElement(root, "RasterSettings", dict(RASTER_ATTRS))
-    for t, v in RASTERS:
+    for t, v in _rasters(cand.get("tint_region", "US")):
         ET.SubElement(rs, "Raster", {"Type": t, "Value": v})
     ET.indent(root, space="\t")
     return '<?xml version="1.0"?>\n' + ET.tostring(root, encoding="unicode") + "\n", notes
@@ -1646,7 +1771,7 @@ def candidate_xml(result, cand, use_labels=True):
 STP_INKZONE_MM = 32.5
 
 
-def _stp_row(p, cols, notes, follow, use_labels):
+def _stp_row(p, cols, notes, follow, use_labels, region="US"):
     """The STP type code and ink vector for one slot record."""
     zero = [0] * len(cols)
     kind = p["kind"]
@@ -1675,7 +1800,7 @@ def _stp_row(p, cols, notes, follow, use_labels):
         i = inks[0]
         t = i["tint"]
         lp = p.get("label_pct")
-        if use_labels and lp is not None and lp in (25, 50, 75, 100) and lp != t:
+        if use_labels and lp is not None and (lp in TINT_CLASSES[region] or lp == 100) and lp != t:
             follow.setdefault((lp, i["ink"], t), []).append(p["slot"])
             t = lp
         return ("SD" if t == 100 else "DP"), vec([{"ink": i["ink"], "tint": t}])
@@ -1697,7 +1822,7 @@ def build_stp(cand, title, inkzone_mm=STP_INKZONE_MM, use_labels=True):
     default_width = float(_dim(along))
     body = []
     for p in patches:
-        code, vector = _stp_row(p, cols, notes, follow, use_labels)
+        code, vector = _stp_row(p, cols, notes, follow, use_labels, cand.get("tint_region", "US"))
         body.append(f"{p['slot']},\t{round(p['len_mm'], 2):.5f},\t{code},\t" + ",\t".join(str(v) for v in vector))
     for (want, ink, have), sl in follow.items():
         many = len(sl) > 1
